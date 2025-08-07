@@ -35,6 +35,7 @@ ocr_api_key = os.getenv("OCR_API_KEY")
 OCR_API_URL = "https://api.ocr.space/parse/image"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 gemini_api = os.getenv("gemini_api")
+horizon_api = os.getenv("horizon_api")
 
 def make_json_serializable(obj):
     """Convert pandas/numpy objects to JSON-serializable formats"""
@@ -124,19 +125,55 @@ async def ping_chatgpt(question_text, relevant_context, max_tries=3):
             tries += 1
             continue
 
+async def ping_horizon(question_text, relevant_context="", max_tries=3):
+    tries = 0
+    while tries < max_tries:
+        try:
+            print(f"horizon is running {tries + 1} try")
+            headers = {
+                "Authorization": f"Bearer {horizon_api}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "openrouter/horizon-beta",
+                "messages": [
+                    {"role": "system", "content": relevant_context},
+                    {"role": "user", "content": question_text}
+                ]
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Error during Horizon call: {e}")
+            tries += 1
+    return {"error": "Horizon failed after max retries"}
+
 def extract_json_from_output(output: str) -> str:
     """Extract JSON from output that might contain extra text"""
     output = output.strip()
     
-    json_patterns = [
-        r'\[.*\]',  # Array pattern
-        r'\{.*\}',  # Object pattern
-    ]
+    # First try to find complete JSON objects (prioritize these)
+    object_pattern = r'\{.*\}'
+    object_matches = re.findall(object_pattern, output, re.DOTALL)
     
-    for pattern in json_patterns:
-        matches = re.findall(pattern, output, re.DOTALL)
-        if matches:
-            return matches[0]
+    # If we find JSON objects, return the longest one (most complete)
+    if object_matches:
+        longest_match = max(object_matches, key=len)
+        return longest_match
+    
+    # Only if no objects found, look for arrays
+    array_pattern = r'\[.*\]'
+    array_matches = re.findall(array_pattern, output, re.DOTALL)
+    
+    if array_matches:
+        longest_match = max(array_matches, key=len)
+        return longest_match
     
     return output
 
@@ -548,10 +585,10 @@ async def aianalyst(
         "DATA SUMMARY: " + json.dumps(make_json_serializable(data_summary), indent=2)
     )
 
-    chatgpt_response = await ping_chatgpt(context , "You are a great Python code developer. Who write final code for the answer and our workflow using all the detial provided to you" )
+    horizon_response = await ping_horizon(context, "You are a great Python code developer. Who write final code for the answer and our workflow using all the detail provided to you")
 
     # Clean the code response (remove markdown formatting)
-    raw_code = chatgpt_response["choices"][0]["message"]["content"]
+    raw_code = horizon_response["choices"][0]["message"]["content"]
     lines = raw_code.split('\n')
     clean_lines = []
     in_code_block = False
@@ -624,24 +661,41 @@ async def aianalyst(
             error_message = f"Error: {error_context}\n\nCode:\n{code_content}\n\nTask breakdown:\n{task_breaked}"
             
             fix_prompt = (
-                "CODE FIXING REQUIREMENTS:\n"
-                "DO NOT MAKE ANY ASSUMPTIONS ABOUT THE CODE\n"
-                "FIX THE CODE DO NOT GIVE ANSWER YOURSELF\n OR ANY EXPLANATION\n"
-                "- The following Python code failed to run or didn't produce valid JSON output\n"
-                "- DO NOT ADD markdown tags like ```python or ``` - send only raw code\n"
-                "- Fix the errors but maintain the original logic and functionality\n"
-                "- Return the complete fixed code, not just the problematic parts\n"
-                "- Output MUST be valid JSON format (array [] or object {})\n"
-                "- Use json.dumps() or ensure proper JSON formatting in print statements\n"
-                "- Handle multiple data sources properly (CSV files and databases)\n"
-                "- Install missing packages with pip if needed\n\n"
-                
-                "Data Summary: " + json.dumps(make_json_serializable(data_summary), indent=2) + "\n\n"
-                f"Error Details and Code to Fix:\n{error_message}"
+                """URGENT CODE FIXING TASK:
+                    CURRENT BROKEN CODE:
+                    ```python
+                    {current_code}
+                    ```
+                    ERROR DETAILS:
+                    {initial_error}
+                    AVAILABLE DATA (use these exact sources):
+                    {json.dumps(data_summary, indent=2)}
+
+                    ORIGINAL TASK:
+                    {question_text}
+
+                    TASK BREAKDOWN:
+                    {task_breakdown}
+                    FIXING INSTRUCTIONS:
+                    1. Fix the specific error mentioned above
+                    2. Use ONLY the data sources listed in AVAILABLE DATA section
+                    3. DO NOT add placeholder URLs or fake data
+                    4. DO NOT create imaginary answers - process actual data
+                    5. Ensure final output is valid JSON using json.dumps()
+                    6. Make the code complete and executable
+
+                    COMMON FIXES NEEDED:
+                    - Replace placeholder URLs with actual ones from data_summary
+                    - Fix file path references to match available files
+                    - Add missing imports
+                    - Fix syntax errors
+                    - Ensure proper JSON output format
+
+                    Return ONLY the corrected Python code (no markdown, no explanations):"""
             )
             
-            chatgpt_fix = await ping_chatgpt(fix_prompt, "You are a helpful Python code fixer.")
-            fixed_code = chatgpt_fix["choices"][0]["message"]["content"]
+            horizon_fix = await ping_horizon(fix_prompt, "You are a helpful Python code fixer.")
+            fixed_code = horizon_fix["choices"][0]["message"]["content"]
             
             # Clean the fixed code
             lines = fixed_code.split('\n')
