@@ -105,6 +105,18 @@ def make_json_serializable(obj):
     else:
         return obj
 
+# --- Safe file writing to avoid Windows cp1252 'charmap' UnicodeEncodeErrors ---
+def safe_write(path: str, text: str, replace: bool = True):
+    """Write text to file using UTF-8 regardless of system locale.
+
+    Windows default (cp1252) cannot encode characters like U+2011 (non-breaking hyphen)
+    or U+202F (narrow no-break space) sometimes produced by LLM outputs. This helper
+    forces utf-8 and optionally replaces unencodable characters.
+    """
+    errors_policy = "replace" if replace else "strict"
+    with open(path, "w", encoding="utf-8", errors=errors_policy) as f:
+        f.write(text)
+
 # Add caching for prompt files (with graceful fallback when missing)
 @functools.lru_cache(maxsize=10)
 def read_prompt_file(filename: str, default: str = "") -> str:
@@ -171,34 +183,37 @@ async def ping_chatgpt(question_text, relevant_context, max_tries=3):
             tries += 1
             continue
 
-async def ping_horizon(question_text, relevant_context="", max_tries=3):
+async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
+    """Call Gemini Pro API for code generation."""    
     tries = 0
     while tries < max_tries:
+        if tries % 2 == 0:
+            api_key = gemini_api
+        else:
+            api_key = gemini_api_2
         try:
-            print(f"horizon is running {tries + 1} try")
+            print(f"gemini pro is running {tries + 1} try")
             headers = {
-                "Authorization": f"Bearer {horizon_api}",
+                "x-goog-api-key": api_key,
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": "openrouter/horizon-beta",
-                "messages": [
-                    {"role": "system", "content": relevant_context},
-                    {"role": "user", "content": question_text}
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": relevant_context},
+                            {"text": question_text}
+                        ]
+                    }
                 ]
             }
             async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload
-                )
-                response.raise_for_status()
+                response = await client.post("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent", headers=headers, json=payload)
+                print(response)
                 return response.json()
         except Exception as e:
-            print(f"Error during Horizon call: {e}")
+            print(f"Error creating payload: {e}")
             tries += 1
-    return {"error": "Horizon failed after max retries"}
 
 async def ping_grok(question_text, relevant_context="", max_tries=3):
     """Call Groq's OpenAI-compatible Responses API for code generation using gpt-oss-120b."""
@@ -856,18 +871,12 @@ async def aianalyst(
     )
 
     # horizon_response = await ping_chatgpt(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
-    horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
+    # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
-    if not isinstance(horizon_response, dict):
-        return {"error": "Unexpected Grok response type", "raw": str(horizon_response)[:400]}
-    if "error" in horizon_response and "choices" not in horizon_response:
-        return {"error": "Grok call failed", "details": horizon_response.get("error"), "raw": horizon_response}
-    if "choices" not in horizon_response or not horizon_response.get("choices"):
-        return {"error": "Grok response missing choices", "raw": horizon_response}
-    try:
-        raw_code = horizon_response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        return {"error": "Unexpected Grok response shape", "exception": str(e), "raw": horizon_response}
+    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS. Write final code for the answer and our workflow using all the detail provided to you")
+    raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
+
+    
     lines = raw_code.split('\n')
     clean_lines = []
     in_code_block = False
@@ -978,12 +987,14 @@ async def aianalyst(
                 "- Ensure proper JSON output format\n\n" +
                 "Return ONLY the corrected Python code (no markdown, no explanations):"
             )
-            with open("fix.txt","w")as f:
-                f.write(fix_prompt)
+            # Write fix prompt safely (avoid cp1252 encoding errors on Windows)
+            safe_write("fix.txt", fix_prompt)
 
-            horizon_fix = await fix_with_grok(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            fixed_code = horizon_fix["choices"][0]["message"]["content"]
-            
+            # horizon_fix = await fix_with_grok(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            # fixed_code = horizon_fix["choices"][0]["message"]["content"]
+            gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            fixed_code = gemini_fix["candidates"][0]["content"]["parts"][0]["text"]
+
             # Clean the fixed code
             lines = fixed_code.split('\n')
             clean_lines = []
