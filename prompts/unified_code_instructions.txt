@@ -92,6 +92,16 @@ SQL QUERY EXAMPLES BY QUESTION TYPE:
    LIMIT 50
 
 KEY SQL PRINCIPLES:
+When calculating the difference between two dates in DuckDB, do not use date_part() on the subtraction result.
+Instead:
+
+Use DATEDIFF('day', start_date, end_date) for number of days.
+
+Or use date_part() only on actual DATE/TIMESTAMP/INTERVAL types.
+
+Always check the DuckDB function signature before applying a function.
+
+If a function call results in a type mismatch, either cast to the required type or choose an alternative function that directly returns the needed value.
 🎯 Use WHERE clauses to filter at source
 🎯 Use GROUP BY for aggregations
 🎯 Use ORDER BY + LIMIT for rankings
@@ -117,3 +127,4 @@ REQUIRED PATTERNS:
 - JSON output with json.dumps()
 
 REMEMBER: The database is your calculator - use it to compute the answer, don't just fetch raw data!
+REMEMBER: When writing SQL queries, always make take precautions for special columns like date time to reduce error chance aim for precision and efficiency.
