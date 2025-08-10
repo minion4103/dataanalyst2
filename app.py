@@ -19,6 +19,7 @@ from io import StringIO
 from urllib.parse import urlparse
 import duckdb
 import glob
+import tabula
 
 app = FastAPI()
 load_dotenv()
@@ -471,6 +472,260 @@ async def scrape_all_urls(urls: list) -> list:
     
     return scraped_data
 
+def normalize_column_names(columns):
+    """Normalize column names for consistent matching"""
+    normalized = []
+    for col in columns:
+        # Convert to string, strip whitespace, normalize case
+        normalized_col = str(col).strip().lower()
+        # Replace multiple spaces/tabs with single space
+        normalized_col = re.sub(r'\s+', ' ', normalized_col)
+        normalized.append(normalized_col)
+    return normalized
+
+def columns_match(cols1, cols2, threshold=0.6):
+    """Check if two sets of columns match with some tolerance"""
+    norm_cols1 = normalize_column_names(cols1)
+    norm_cols2 = normalize_column_names(cols2)
+    
+    if len(norm_cols1) != len(norm_cols2):
+        print(f"   🔍 Column count mismatch: {len(norm_cols1)} vs {len(norm_cols2)}")
+        return False
+    
+    # Check exact match first
+    if norm_cols1 == norm_cols2:
+        print(f"   ✅ Exact column match found")
+        return True
+    
+    # Check similarity for each column pair
+    matches = 0
+    for c1, c2 in zip(norm_cols1, norm_cols2):
+        if c1 == c2:
+            matches += 1
+        else:
+            # Simple similarity check (you could use more sophisticated methods)
+            if c1 and c2:  # Avoid empty strings
+                similarity = len(set(c1.split()) & set(c2.split())) / max(len(c1.split()), len(c2.split()))
+                if similarity >= threshold:
+                    matches += 1
+                    print(f"   🔍 Similar columns: '{c1}' ≈ '{c2}' (similarity: {similarity:.2f})")
+    
+    match_ratio = matches / len(norm_cols1)
+    result = match_ratio >= threshold
+    print(f"   🔍 Column match ratio: {match_ratio:.2f} (threshold: {threshold}) = {'✅ MATCH' if result else '❌ NO MATCH'}")
+    return result
+
+async def process_pdf_files() -> list:
+    """Process all PDF files in current directory and extract tables, combining tables with same headers"""
+    pdf_data = []
+    
+    # Find all PDF files in current directory
+    pdf_files = glob.glob("*.pdf")
+    if not pdf_files:
+        print("📄 No PDF files found in current directory")
+        return pdf_data
+    
+    print(f"📄 Found {len(pdf_files)} PDF files to process")
+    
+    all_raw_tables = []  # Store all raw tables
+    
+    # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
+    print("🔄 Phase 1: Extracting raw tables from all PDFs...")
+    for i, pdf_file in enumerate(pdf_files):
+        try:
+            print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
+            
+            # Extract all tables from PDF using tabula
+            try:
+                # Extract tables with various configurations to catch different table formats
+                tables = tabula.read_pdf(
+                    pdf_file, 
+                    pages='all', 
+                    multiple_tables=True,
+                    pandas_options={'header': 'infer'},
+                    lattice=True,  # For tables with clear borders
+                    silent=True
+                )
+                
+                # If lattice method didn't work well, try stream method
+                if not tables or all(df.empty for df in tables):
+                    print("📄 Retrying with stream method...")
+                    tables = tabula.read_pdf(
+                        pdf_file, 
+                        pages='all', 
+                        multiple_tables=True,
+                        pandas_options={'header': 'infer'},
+                        stream=True,  # For tables without clear borders
+                        silent=True
+                    )
+                
+            except Exception as tabula_error:
+                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
+                continue
+            
+            if not tables:
+                print(f"⚠️ No tables found in {pdf_file}")
+                continue
+            
+            print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
+            
+            # Store all raw tables with metadata (NO PROCESSING)
+            for j, raw_df in enumerate(tables):
+                if raw_df.empty:
+                    print(f"⚠️ Table {j+1} is empty, skipping")
+                    continue
+                
+                table_metadata = {
+                    "raw_dataframe": raw_df,
+                    "source_pdf": pdf_file,
+                    "table_number": j + 1,
+                    "raw_columns": list(raw_df.columns)
+                }
+                
+                all_raw_tables.append(table_metadata)
+                print(f"✅ Stored raw table {j+1} from {pdf_file} ({raw_df.shape[0]} rows, {raw_df.shape[1]} cols)")
+                print(f"   📋 Columns: {list(raw_df.columns)}")
+        
+        except Exception as e:
+            print(f"❌ Failed to process PDF {pdf_file}: {e}")
+    
+    if not all_raw_tables:
+        print("❌ No tables extracted from any PDF files")
+        return pdf_data
+    
+    print(f"📊 Phase 1 complete: {len(all_raw_tables)} raw tables extracted")
+    
+    # Second pass: Group raw tables by similar headers
+    print("\n🔄 Phase 2: Grouping tables with similar headers...")
+    combined_data_groups = {}
+    
+    for table_meta in all_raw_tables:
+        columns = table_meta["raw_columns"]
+        
+        print(f"\n🔍 Analyzing table from {table_meta['source_pdf']} (table {table_meta['table_number']})")
+        print(f"   📋 Columns: {columns}")
+        
+        # Find existing group with matching headers
+        found_group = None
+        for group_key, group_data in combined_data_groups.items():
+            print(f"   🔄 Comparing with group '{group_key}':")
+            if columns_match(columns, group_data["reference_columns"]):
+                found_group = group_key
+                break
+        
+        if found_group:
+            # Add to existing group
+            combined_data_groups[found_group]["raw_tables"].append(table_meta)
+            print(f"   ➕ Added to existing group '{found_group}' (now {len(combined_data_groups[found_group]['raw_tables'])} tables)")
+        else:
+            # Create new group
+            group_name = f"table_group_{len(combined_data_groups) + 1}"
+            combined_data_groups[group_name] = {
+                "reference_columns": columns,
+                "raw_tables": [table_meta]
+            }
+            print(f"   🆕 Created new group '{group_name}'")
+    
+    print(f"\n📊 Phase 2 complete: {len(combined_data_groups)} group(s) created")
+    for group_name, group_data in combined_data_groups.items():
+        print(f"   📁 {group_name}: {len(group_data['raw_tables'])} tables")
+        for table in group_data['raw_tables']:
+            print(f"      - {table['source_pdf']} (table {table['table_number']})")
+    
+    # Third pass: Simply merge tables and save (NO data_scrape processing)
+    print("\n🔄 Phase 3: Merging grouped tables and saving...")
+    
+    for group_name, group_data in combined_data_groups.items():
+        raw_tables_in_group = group_data["raw_tables"]
+        reference_columns = group_data["reference_columns"]
+        
+        print(f"\n🔗 Processing group '{group_name}' with {len(raw_tables_in_group)} table(s)...")
+        
+        # Merge all raw tables in this group
+        combined_raw_dfs = []
+        source_pdfs = []
+        
+        for table_meta in raw_tables_in_group:
+            raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
+            
+            # Ensure column names match the reference
+            if list(raw_df.columns) != reference_columns:
+                print(f"   🔧 Standardizing columns for {table_meta['source_pdf']}")
+                raw_df.columns = reference_columns
+            
+            # Add source tracking
+            raw_df['source_pdf'] = table_meta["source_pdf"]
+            raw_df['table_number'] = table_meta["table_number"]
+            
+            combined_raw_dfs.append(raw_df)
+            source_pdfs.append(table_meta["source_pdf"])
+            print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
+        
+        # Combine all raw DataFrames
+        try:
+            print(f"   🔗 Merging {len(combined_raw_dfs)} raw tables...")
+            merged_df = pd.concat(combined_raw_dfs, ignore_index=True)
+            print(f"   ✅ Merged into single table: {merged_df.shape[0]} rows, {merged_df.shape[1]} cols")
+            
+            # Create a meaningful filename
+            if len(combined_data_groups) == 1:
+                # Only one type of table across all PDFs
+                csv_filename = "combined_tables.csv"
+            else:
+                # Multiple different table types
+                first_col = reference_columns[0] if reference_columns else "data"
+                clean_name = re.sub(r'[^\w\s-]', '', str(first_col)).strip()
+                clean_name = re.sub(r'[-\s]+', '_', clean_name)
+                csv_filename = f"combined_{clean_name[:20]}.csv"
+            
+            # Save the merged data directly (no processing)
+            merged_df.to_csv(csv_filename, index=False, encoding="utf-8")
+            
+            table_info = {
+                "filename": csv_filename,
+                "source_pdfs": list(set(source_pdfs)),
+                "table_count": len(raw_tables_in_group),
+                "shape": merged_df.shape,
+                "columns": list(merged_df.columns),
+                "sample_data": merged_df.head(3).to_dict('records'),
+                "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
+                "formatting_applied": "None - raw data preserved"
+            }
+            
+            pdf_data.append(table_info)
+            print(f"   💾 Saved merged table as {csv_filename}")
+            print(f"   📊 Final: {merged_df.shape[0]} rows, {merged_df.shape[1]} columns")
+            print(f"   📋 Sources: {', '.join(set(source_pdfs))}")
+            
+        except Exception as merge_error:
+            print(f"❌ Error merging group {group_name}: {merge_error}")
+            # Fallback: save individual tables
+            for idx, table_meta in enumerate(raw_tables_in_group):
+                raw_df = table_meta["raw_dataframe"]
+                csv_filename = f"fallback_{group_name}_table_{idx+1}.csv"
+                raw_df.to_csv(csv_filename, index=False, encoding="utf-8")
+                
+                table_info = {
+                    "filename": csv_filename,
+                    "source_pdfs": [table_meta["source_pdf"]],
+                    "table_count": 1,
+                    "shape": raw_df.shape,
+                    "columns": list(raw_df.columns),
+                    "sample_data": raw_df.head(3).to_dict('records'),
+                    "description": f"Fallback raw table from {table_meta['source_pdf']} (merge failed)",
+                    "formatting_applied": "None - raw data preserved"
+                }
+                
+                pdf_data.append(table_info)
+                print(f"💾 Saved fallback table as {csv_filename}")
+    
+    if pdf_data:
+        print(f"\n✅ Processing complete: Created {len(pdf_data)} output file(s)")
+        print(f"📊 Merged {len(all_raw_tables)} total tables from {len(pdf_files)} PDF files")
+    
+    return pdf_data
+
+
 async def get_database_schemas(database_files: list) -> list:
     """Get schema and sample data from database files without loading full data"""
     database_info = []
@@ -549,31 +804,44 @@ async def get_database_schemas(database_files: list) -> list:
     conn.close()
     return database_info
 
-def create_data_summary(csv_data: list, provided_csv_info: dict, database_info: list) -> dict:
+def create_data_summary(csv_data: list, 
+                        provided_csv_info: dict, 
+                        database_info: list, 
+                        pdf_data: list = None,
+                        provided_html_info: dict = None,
+                        provided_json_info: dict = None) -> dict:
     """Create comprehensive data summary for LLM code generation.
+    Extended to support optional provided HTML & JSON sources converted to CSV.
     Ensures total_sources counts unique sources across categories (no double counting)."""
 
     summary = {
         "provided_csv": None,
+        "provided_html": None,
+        "provided_json": None,
         "scraped_data": [],
         "database_files": [],
+        "pdf_extracted_tables": [],
         "total_sources": 0,
     }
 
-    # Add provided CSV info
+    # Add provided sources if present
     if provided_csv_info:
         summary["provided_csv"] = provided_csv_info
+    if provided_html_info:
+        summary["provided_html"] = provided_html_info
+    if provided_json_info:
+        summary["provided_json"] = provided_json_info
 
-    # Add scraped data
     summary["scraped_data"] = csv_data
-
-    # Add database info
     summary["database_files"] = database_info
+    if pdf_data:
+        summary["pdf_extracted_tables"] = pdf_data
 
     # Compute unique total sources by identifiers (filenames/URLs)
     identifiers = set()
-    if provided_csv_info and provided_csv_info.get("filename"):
-        identifiers.add(os.path.normpath(provided_csv_info["filename"]))
+    for info in [provided_csv_info, provided_html_info, provided_json_info]:
+        if info and info.get("filename"):
+            identifiers.add(os.path.normpath(info["filename"]))
     for item in csv_data or []:
         fn = item.get("filename")
         if fn:
@@ -581,28 +849,45 @@ def create_data_summary(csv_data: list, provided_csv_info: dict, database_info: 
     for item in database_info or []:
         src = item.get("source_url") or item.get("filename")
         if src:
-            # Normalize only path-like strings; URLs can be left as-is
             try:
                 norm = os.path.normpath(src) if not (src.startswith("http://") or src.startswith("https://") or src.startswith("s3://")) else src
             except Exception:
                 norm = src
             identifiers.add(norm)
+    for item in pdf_data or []:
+        pdf_file = item.get("source_pdf")
+        if pdf_file:
+            identifiers.add(os.path.normpath(pdf_file))
 
     summary["total_sources"] = len(identifiers)
     return summary
 
 @app.post("/aianalyst/")
 async def aianalyst(
-    file: UploadFile = File(...),
+    questions_txt: UploadFile = File(alias="questions.txt"),
     image: UploadFile = File(None),
-    csv: UploadFile = File(None)
+    data_csv: UploadFile = File(None, alias="data.csv"),
+    pdf: UploadFile = File(None),
+    # Accept both "data_html" and "data.html" field names
+    data_html: UploadFile = File(None),
+    data_html_alt: UploadFile = File(None, alias="data.html"),
+    # Accept both "data_json" and "data.json" field names
+    data_json: UploadFile = File(None),
+    data_json_alt: UploadFile = File(None, alias="data.json")
 ):
+ 
     time_start = time.time()
     # Track files created during this request
     initial_snapshot = _snapshot_files(".")
     created_files: set[str] = set()
-    content = await file.read()
-    question_text = content.decode("utf-8")
+    
+    # Handle questions text file
+    question_text = ""
+    if questions_txt:
+        content = await questions_txt.read()
+        question_text = content.decode("utf-8")
+    else:
+        question_text = "No questions provided"
 
     # Handle image if provided (existing logic)
     if image:
@@ -665,12 +950,14 @@ async def aianalyst(
         f.write(str(task_breaked))
     created_files.add(os.path.normpath("broken_down_tasks.txt"))
 
-    # Proceed with remaining steps (CSV processing, source extraction, etc.)
+    # Proceed with remaining steps (CSV/HTML/JSON processing, source extraction, etc.)
     # ----------------------------------------------------------------------
     provided_csv_info = None
-    if csv:
+    provided_html_info = None
+    provided_json_info = None
+    if data_csv:
         try:
-            csv_content = await csv.read()
+            csv_content = await data_csv.read()
             csv_df = pd.read_csv(StringIO(csv_content.decode("utf-8")))
             
             # Clean the CSV
@@ -695,6 +982,203 @@ async def aianalyst(
         except Exception as e:
             print(f"❌ Error processing provided CSV: {e}")
 
+    # Handle provided HTML file (convert table to CSV via existing extraction pipeline)
+    # Prefer primary plain name, fallback to alias variant
+    html_upload = data_html or data_html_alt
+    if html_upload:
+        try:
+            print("🌐 Processing uploaded HTML file...")
+            html_bytes = await html_upload.read()
+            html_text = html_bytes.decode("utf-8", errors="replace")
+            sourcer = data_scrape.ImprovedWebScraper()
+            df_html = await sourcer.web_scraper.extract_table_from_html(html_text)
+            if df_html is not None and not df_html.empty:
+                cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
+                html_csv_name = "ProvidedHTML.csv"
+                cleaned_html_df.to_csv(html_csv_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(html_csv_name))
+                provided_html_info = {
+                    "filename": html_csv_name,
+                    "shape": cleaned_html_df.shape,
+                    "columns": list(cleaned_html_df.columns),
+                    "sample_data": cleaned_html_df.head(3).to_dict('records'),
+                    "description": "User-provided HTML file (table extracted, cleaned & formatted)",
+                    "formatting_applied": formatting_html
+                }
+                print(f"📝 Provided HTML processed: {cleaned_html_df.shape} saved as {html_csv_name}")
+            else:
+                print("⚠️ No table extracted from provided HTML")
+        except Exception as e:
+            print(f"❌ Error processing provided HTML: {e}")
+
+    # Handle provided JSON file
+    json_upload = data_json or data_json_alt
+    if json_upload:
+        try:
+            print("🗂️ Processing uploaded JSON file...")
+            json_bytes = await json_upload.read()
+            json_text = json_bytes.decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(json_text)
+            except Exception as je:
+                print(f"❌ JSON parse error: {je}")
+                parsed = None
+            df_json = None
+            if isinstance(parsed, list):
+                # list of dicts or primitives
+                if parsed and isinstance(parsed[0], dict):
+                    df_json = pd.DataFrame(parsed)
+                else:
+                    df_json = pd.DataFrame({"value": parsed})
+            elif isinstance(parsed, dict):
+                # direct columns pattern
+                if all(isinstance(v, list) for v in parsed.values()):
+                    try:
+                        df_json = pd.DataFrame(parsed)
+                    except Exception:
+                        pass
+                # search for list of dicts inside
+                if df_json is None:
+                    candidate = None
+                    for k, v in parsed.items():
+                        if isinstance(v, list) and v and isinstance(v[0], dict):
+                            candidate = v
+                            break
+                    if candidate:
+                        df_json = pd.DataFrame(candidate)
+                # fallback single-row
+                if df_json is None:
+                    df_json = pd.DataFrame([parsed])
+            if df_json is not None and not df_json.empty:
+                sourcer = data_scrape.ImprovedWebScraper()
+                cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
+                json_csv_name = "ProvidedJSON.csv"
+                cleaned_json_df.to_csv(json_csv_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(json_csv_name))
+                provided_json_info = {
+                    "filename": json_csv_name,
+                    "shape": cleaned_json_df.shape,
+                    "columns": list(cleaned_json_df.columns),
+                    "sample_data": cleaned_json_df.head(3).to_dict('records'),
+                    "description": "User-provided JSON file (converted, cleaned & formatted)",
+                    "formatting_applied": formatting_json
+                }
+                print(f"📝 Provided JSON processed: {cleaned_json_df.shape} saved as {json_csv_name}")
+            else:
+                print("⚠️ Could not construct DataFrame from JSON content")
+        except Exception as e:
+            print(f"❌ Error processing provided JSON: {e}")
+
+    # Step 3.5: Handle provided PDF file
+    uploaded_pdf_data = []
+    if pdf:
+        try:
+            print("📄 Processing uploaded PDF file...")
+            pdf_content = await pdf.read()
+            
+            # Save uploaded PDF temporarily
+            temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
+            with open(temp_pdf_filename, "wb") as f:
+                f.write(pdf_content)
+            created_files.add(os.path.normpath(temp_pdf_filename))
+            
+            print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
+
+            # Extract tables (raw) then group & merge by header before any CSV creation
+            try:
+                tables = tabula.read_pdf(
+                    temp_pdf_filename,
+                    pages='all',
+                    multiple_tables=True,
+                    pandas_options={'header': 'infer'},
+                    lattice=True,
+                    silent=True
+                )
+                if not tables or all(df.empty for df in tables):
+                    print("📄 Retrying with stream method...")
+                    tables = tabula.read_pdf(
+                        temp_pdf_filename,
+                        pages='all',
+                        multiple_tables=True,
+                        pandas_options={'header': 'infer'},
+                        stream=True,
+                        silent=True
+                    )
+            except Exception as tabula_error:
+                print(f"❌ Tabula extraction failed for uploaded PDF: {tabula_error}")
+                tables = []
+
+            if not tables:
+                print("⚠️ No tables found in uploaded PDF")
+            else:
+                print(f"📊 Found {len(tables)} raw tables (pages) in uploaded PDF – grouping by header before saving")
+                raw_tables = []
+                for j, raw_df in enumerate(tables):
+                    if raw_df.empty:
+                        print(f"⏭️ Skipping empty table {j+1}")
+                        continue
+                    raw_tables.append({
+                        "dataframe": raw_df,
+                        "table_number": j + 1,
+                        "columns": list(raw_df.columns)
+                    })
+
+                # Group by similar headers
+                groups = []
+                for tbl in raw_tables:
+                    placed = False
+                    for grp in groups:
+                        if columns_match(tbl["columns"], grp["reference_columns"]):
+                            grp["tables"].append(tbl)
+                            placed = True
+                            break
+                    if not placed:
+                        groups.append({
+                            "reference_columns": tbl["columns"],
+                            "tables": [tbl]
+                        })
+                print(f"📦 Created {len(groups)} header group(s) from uploaded PDF")
+
+                sourcer = data_scrape.ImprovedWebScraper()
+                single_group = len(groups) == 1
+                base_name = os.path.splitext(temp_pdf_filename)[0]
+
+                for g_idx, grp in enumerate(groups, start=1):
+                    merged_df = pd.concat([t["dataframe"].copy() for t in grp["tables"]], ignore_index=True)
+                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} page tables into {merged_df.shape[0]} rows")
+                    try:
+                        cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(merged_df)
+                    except Exception as fmt_err:
+                        print(f"⚠️ Numeric formatting failed for group {g_idx}: {fmt_err}; using raw merged data")
+                        cleaned_df = merged_df
+                        formatting_results = {}
+
+                    if single_group:
+                        csv_filename = "data.csv"
+                    else:
+                        first_col = grp["reference_columns"][0] if grp["reference_columns"] else f"group_{g_idx}"
+                        safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
+                        csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
+
+                    cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
+                    created_files.add(os.path.normpath(csv_filename))
+                    table_info = {
+                        "filename": csv_filename,
+                        "source_pdf": temp_pdf_filename,
+                        "table_number": g_idx,
+                        "merged_from_tables": [t["table_number"] for t in grp["tables"]],
+                        "page_table_count": len(grp["tables"]),
+                        "shape": cleaned_df.shape,
+                        "columns": list(cleaned_df.columns),
+                        "sample_data": cleaned_df.head(3).to_dict('records'),
+                        "description": f"Merged table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} page tables with identical/compatible headers",
+                        "formatting_applied": formatting_results
+                    }
+                    uploaded_pdf_data.append(table_info)
+                    print(f"💾 Saved merged group {g_idx} as {csv_filename}")
+        except Exception as e:
+            print(f"❌ Error processing uploaded PDF: {e}")
+
     # Step 4: Extract all URLs and database files from question
     print("🔍 Extracting all data sources from question...")
     extracted_sources = await extract_all_urls_and_databases(question_text)
@@ -706,31 +1190,53 @@ async def aianalyst(
     scraped_data = []
     if extracted_sources.get('scrape_urls'):
         scraped_data = await scrape_all_urls(extracted_sources['scrape_urls'])
-        # register scraped CSVs reported by the scraper
         for item in scraped_data:
             fn = item.get("filename")
             if fn:
                 created_files.add(os.path.normpath(fn))
 
+    # Step 5.5: Process local PDF files (already merges inside helper)
+    print("📄 Processing local PDF files...")
+    local_pdf_data = await process_pdf_files()
+    for item in local_pdf_data:
+        fn = item.get("filename")
+        if fn:
+            created_files.add(os.path.normpath(fn))
+
+    # Combine uploaded and local PDF data
+    pdf_data = uploaded_pdf_data + local_pdf_data
+    
+    if pdf_data:
+        print(f"📄 Total extracted tables: {len(pdf_data)} ({len(uploaded_pdf_data)} from uploaded PDF, {len(local_pdf_data)} from local PDFs)")
+    elif uploaded_pdf_data:
+        print(f"📄 Extracted {len(uploaded_pdf_data)} tables from uploaded PDF")
+    elif local_pdf_data:
+        print(f"� Extracted {len(local_pdf_data)} tables from local PDF files")
+
     # Step 6: Get database schemas and sample data
-    # Build list of database files to process, prioritizing the uploaded CSV if present
     database_info = []
     database_files_to_process = []
-
-    # If a CSV was uploaded, include it for schema extraction first
     if provided_csv_info:
         database_files_to_process.append({
-            "url": "ProvidedCSV.csv",
+            "url": provided_csv_info.get("filename", "ProvidedCSV.csv"),
             "format": "csv",
-            "description": "User-provided CSV file (cleaned and formatted)",
+            "description": provided_csv_info.get("description", "User-provided CSV file (cleaned and formatted)"),
         })
-
-    # Extend with extracted database files, but skip nonexistent local files
+    if provided_html_info:
+        database_files_to_process.append({
+            "url": provided_html_info.get("filename", "ProvidedHTML.csv"),
+            "format": "csv",
+            "description": provided_html_info.get("description", "User-provided HTML file (cleaned and formatted)"),
+        })
+    if provided_json_info:
+        database_files_to_process.append({
+            "url": provided_json_info.get("filename", "ProvidedJSON.csv"),
+            "format": "csv",
+            "description": provided_json_info.get("description", "User-provided JSON file (cleaned and formatted)"),
+        })
     extracted_db_files = extracted_sources.get('database_files', []) or []
-
     def _looks_like_url(u: str) -> bool:
         return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://") or u.startswith("s3://"))
-
     for db in extracted_db_files:
         try:
             url = db.get("url")
@@ -740,21 +1246,18 @@ async def aianalyst(
             if _looks_like_url(url):
                 database_files_to_process.append({"url": url, "format": fmt, "description": db.get("description", f"Database file ({fmt})")})
             else:
-                # Local path: include only if it exists to avoid errors like sample-sales.csv
                 if os.path.exists(url):
                     database_files_to_process.append({"url": url, "format": fmt, "description": db.get("description", f"Database file ({fmt})")})
                 else:
                     print(f"⏭️ Skipping nonexistent local database file: {url}")
-        except Exception as _e:
-            # If anything odd occurs, just skip this entry
+        except Exception:
             print(f"⏭️ Skipping invalid database file entry: {db}")
-
     if database_files_to_process:
         print(f"📊 Will process {len(database_files_to_process)} database files for schema extraction")
         database_info = await get_database_schemas(database_files_to_process)
 
     # Step 7: Create comprehensive data summary
-    data_summary = create_data_summary(scraped_data, provided_csv_info, database_info)
+    data_summary = create_data_summary(scraped_data, provided_csv_info, database_info, pdf_data, provided_html_info, provided_json_info)
     
     # Save data summary for debugging
     with open("data_summary.json", "w", encoding="utf-8") as f:
@@ -786,7 +1289,7 @@ async def aianalyst(
     # horizon_response = await ping_chatgpt(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
-    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
     raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
 
     
