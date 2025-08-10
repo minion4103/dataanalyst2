@@ -219,6 +219,13 @@ class NumericFieldFormatter:
             if pd.api.types.is_datetime64_any_dtype(df[col]) or pd.api.types.is_timedelta64_dtype(df[col]):
                 continue
                 
+            # Skip columns that are clearly text-based by column name
+            column_name_lower = col.lower()
+            text_column_indicators = ['source', 'note', 'notes', 'description', 'comment', 'remarks', 'location', 'name', 'title', 'status']
+            if any(indicator in column_name_lower for indicator in text_column_indicators):
+                print(f"Skipping text column: {col}")
+                continue
+                
             sample_values = df[col].dropna().astype(str).head(20).tolist()
             
             # Check if most values look numeric
@@ -241,8 +248,15 @@ class NumericFieldFormatter:
     
     def _looks_numeric(self, value: str) -> bool:
         """Check if a string value looks like it could be numeric"""
+        value_str = str(value).strip()
+        
+        # If value contains common text words, it's not numeric
+        text_indicators = ['projection', 'estimate', 'census', 'official', 'result', 'annual', 'monthly', 'quarterly', 'national', 'from', 'the', 'united', 'nations']
+        if any(indicator in value_str.lower() for indicator in text_indicators):
+            return False
+        
         # Remove common non-numeric characters
-        cleaned = re.sub(r'[,$%€£¥₹₽\s\[\]#\-TFRK]', '', str(value))
+        cleaned = re.sub(r'[,$%€£¥₹₽\s\[\]#\-TFRK]', '', value_str)
         
         # Check if what remains is mostly digits and decimal points
         if not cleaned:
@@ -501,6 +515,11 @@ class NumericFieldFormatter:
         
         # Create a copy to avoid modifying original
         formatted_df = df.copy()
+        
+        # Remove trailing commas from all text columns before any processing
+        for col in formatted_df.columns:
+            if formatted_df[col].dtype == 'object':
+                formatted_df[col] = formatted_df[col].astype(str).str.replace(r',$', '', regex=True)
         
         # Use LLM to identify numeric columns
         numeric_columns = await self.identify_numeric_columns(formatted_df)
@@ -1551,6 +1570,11 @@ class WebScraper:
         
         # Basic cleaning
         df_clean = df.copy()
+        
+        # FIRST: Remove trailing commas from all text columns before any other processing
+        for col in df_clean.columns:
+            if df_clean[col].dtype == 'object':  # Text columns
+                df_clean[col] = df_clean[col].astype(str).str.replace(',', '')
         
         # Remove empty rows and columns
         df_clean = df_clean.dropna(how='all').reset_index(drop=True)

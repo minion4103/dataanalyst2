@@ -215,95 +215,8 @@ async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
             print(f"Error creating payload: {e}")
             tries += 1
 
-async def ping_grok(question_text, relevant_context="", max_tries=3):
-    """Call Groq's OpenAI-compatible Responses API for code generation using gpt-oss-120b."""
 
-    if not grok_api:
-        return {"error": "GROQ_API_KEY not configured"}
 
-    tries = 0
-    while tries < max_tries:
-        try:
-            print(f"grok is running {tries + 1} try")
-            headers = {
-                "Authorization": f"Bearer {grok_api}",
-                "Content-Type": "application/json"
-            }
-
-            # Structured messages for better instruction handling
-            messages = []
-            if relevant_context:
-                messages.append({"role": "system", "content": relevant_context})
-            messages.append({"role": "user", "content": question_text})
-
-            payload = {
-                "model": "openai/gpt-oss-120b",
-                "messages": messages,
-                "temperature": 0.2,         # Low temp for deterministic code
-                "tool_choice": "none",      # Avoids forcing search tools
-            }
-
-            async with httpx.AsyncClient(timeout=180) as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload
-                )
-                response.raise_for_status()
-                result = response.json()
-                return result
-
-        except Exception as e:
-            print(f"Error during Grok call: {e}")
-            tries += 1
-
-    return {"error": "Grok failed after max retries"}
-
-async def fix_with_grok(question_text, relevant_context="", max_tries=3):
-    """Call Groq's API (using grok_fix_api key) for code FIXING purposes.
-
-    Mirrors ping_grok but authenticates with grok_fix_api so quota / routing can
-    be separated for fix attempts.
-    """
-
-    if not grok_fix_api:
-        return {"error": "grok_fix_api key not configured"}
-
-    tries = 0
-    while tries < max_tries:
-        try:
-            print(f"grok (fix) is running {tries + 1} try")
-            headers = {
-                "Authorization": f"Bearer {grok_fix_api}",
-                "Content-Type": "application/json"
-            }
-
-            messages = []
-            if relevant_context:
-                messages.append({"role": "system", "content": relevant_context})
-            messages.append({"role": "user", "content": question_text})
-
-            payload = {
-                "model": "openai/gpt-oss-120b",
-                "messages": messages,
-                "temperature": 0.2,
-                "tool_choice": "none",
-            }
-
-            async with httpx.AsyncClient(timeout=180) as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload
-                )
-                response.raise_for_status()
-                return response.json()
-
-        except Exception as e:
-            print(f"Error during Grok fix call: {e}")
-            tries += 1
-
-    return {"error": "Grok fix failed after max retries"}
 
 def extract_json_from_output(output: str) -> str:
     """Extract JSON from output that might contain extra text"""
@@ -873,7 +786,7 @@ async def aianalyst(
     # horizon_response = await ping_chatgpt(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
-    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS. Write final code for the answer and our workflow using all the detail provided to you")
+    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
     raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
 
     
@@ -993,7 +906,7 @@ async def aianalyst(
             # horizon_fix = await fix_with_grok(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
             # fixed_code = horizon_fix["choices"][0]["message"]["content"]
             gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            fixed_code = gemini_fix["candidates"][0]["content"]["parts"][0]["text"]
+            fixed_code = ping_chatgpt["choices"][0]["message"]["content"]
 
             # Clean the fixed code
             lines = fixed_code.split('\n')
