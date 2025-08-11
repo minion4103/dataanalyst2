@@ -864,16 +864,20 @@ def create_data_summary(csv_data: list,
 
 @app.post("/aianalyst/")
 async def aianalyst(
-    questions_txt: UploadFile = File(alias="questions.txt"),
-    image: UploadFile = File(None),
+    # Accept any files and determine type by extension
+    file1: UploadFile = File(None),
+    file2: UploadFile = File(None),
+    file3: UploadFile = File(None),
+    file4: UploadFile = File(None),
+    file5: UploadFile = File(None),
+    file6: UploadFile = File(None),
+    file7: UploadFile = File(None),
+    file8: UploadFile = File(None),
+    # Keep some backward compatibility aliases
+    questions_txt: UploadFile = File(None, alias="questions.txt"),
     data_csv: UploadFile = File(None, alias="data.csv"),
-    pdf: UploadFile = File(None),
-    # Accept both "data_html" and "data.html" field names
-    data_html: UploadFile = File(None),
-    data_html_alt: UploadFile = File(None, alias="data.html"),
-    # Accept both "data_json" and "data.json" field names
-    data_json: UploadFile = File(None),
-    data_json_alt: UploadFile = File(None, alias="data.json")
+    data_html: UploadFile = File(None, alias="data.html"),
+    data_json: UploadFile = File(None, alias="data.json")
 ):
  
     time_start = time.time()
@@ -881,11 +885,54 @@ async def aianalyst(
     initial_snapshot = _snapshot_files(".")
     created_files: set[str] = set()
     
+    # Categorize uploaded files by extension
+    uploaded_files = [f for f in [file1, file2, file3, file4, file5, file6, file7, file8, questions_txt, data_csv, data_html, data_json] if f is not None]
+    
+    # Initialize file type variables
+    questions_file_upload = None
+    image = None
+    pdf = None
+    csv_file = None
+    html_file = None
+    json_file = None
+    
+    # Categorize files by extension
+    for file in uploaded_files:
+        if file.filename:
+            filename_lower = file.filename.lower()
+            if filename_lower.endswith('.txt'):
+                if questions_file_upload is None:  # Take first .txt file as questions
+                    questions_file_upload = file
+            elif filename_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp')):
+                if image is None:  # Take first image file
+                    image = file
+            elif filename_lower.endswith('.pdf'):
+                if pdf is None:  # Take first PDF file
+                    pdf = file
+            elif filename_lower.endswith('.csv'):
+                if csv_file is None:  # Take first CSV file
+                    csv_file = file
+            elif filename_lower.endswith(('.html', '.htm')):
+                if html_file is None:  # Take first HTML file
+                    html_file = file
+            elif filename_lower.endswith('.json'):
+                if json_file is None:  # Take first JSON file
+                    json_file = file
+    
+    print(f"📁 File categorization complete:")
+    if questions_file_upload: print(f"  📝 Questions: {questions_file_upload.filename}")
+    if image: print(f"  🖼️ Image: {image.filename}")
+    if pdf: print(f"  📄 PDF: {pdf.filename}")
+    if csv_file: print(f"  📊 CSV: {csv_file.filename}")
+    if html_file: print(f"  🌐 HTML: {html_file.filename}")
+    if json_file: print(f"  🗂️ JSON: {json_file.filename}")
+    
     # Handle questions text file
     question_text = ""
-    if questions_txt:
-        content = await questions_txt.read()
+    if questions_file_upload:
+        content = await questions_file_upload.read()
         question_text = content.decode("utf-8")
+        print(f"📝 Questions loaded from file: {questions_file_upload.filename}")
     else:
         question_text = "No questions provided"
 
@@ -955,9 +1002,9 @@ async def aianalyst(
     provided_csv_info = None
     provided_html_info = None
     provided_json_info = None
-    if data_csv:
+    if csv_file:
         try:
-            csv_content = await data_csv.read()
+            csv_content = await csv_file.read()
             csv_df = pd.read_csv(StringIO(csv_content.decode("utf-8")))
             
             # Clean the CSV
@@ -973,7 +1020,7 @@ async def aianalyst(
                 "shape": cleaned_df.shape,
                 "columns": list(cleaned_df.columns),
                 "sample_data": cleaned_df.head(3).to_dict('records'),
-                "description": "User-provided CSV file (cleaned and formatted)",
+                "description": f"User-provided CSV file: {csv_file.filename} (cleaned and formatted)",
                 "formatting_applied": formatting_results
             }
             
@@ -983,12 +1030,10 @@ async def aianalyst(
             print(f"❌ Error processing provided CSV: {e}")
 
     # Handle provided HTML file (convert table to CSV via existing extraction pipeline)
-    # Prefer primary plain name, fallback to alias variant
-    html_upload = data_html or data_html_alt
-    if html_upload:
+    if html_file:
         try:
             print("🌐 Processing uploaded HTML file...")
-            html_bytes = await html_upload.read()
+            html_bytes = await html_file.read()
             html_text = html_bytes.decode("utf-8", errors="replace")
             sourcer = data_scrape.ImprovedWebScraper()
             df_html = await sourcer.web_scraper.extract_table_from_html(html_text)
@@ -1002,7 +1047,7 @@ async def aianalyst(
                     "shape": cleaned_html_df.shape,
                     "columns": list(cleaned_html_df.columns),
                     "sample_data": cleaned_html_df.head(3).to_dict('records'),
-                    "description": "User-provided HTML file (table extracted, cleaned & formatted)",
+                    "description": f"User-provided HTML file: {html_file.filename} (table extracted, cleaned & formatted)",
                     "formatting_applied": formatting_html
                 }
                 print(f"📝 Provided HTML processed: {cleaned_html_df.shape} saved as {html_csv_name}")
@@ -1012,11 +1057,10 @@ async def aianalyst(
             print(f"❌ Error processing provided HTML: {e}")
 
     # Handle provided JSON file
-    json_upload = data_json or data_json_alt
-    if json_upload:
+    if json_file:
         try:
             print("🗂️ Processing uploaded JSON file...")
-            json_bytes = await json_upload.read()
+            json_bytes = await json_file.read()
             json_text = json_bytes.decode("utf-8", errors="replace")
             try:
                 parsed = json.loads(json_text)
@@ -1060,7 +1104,7 @@ async def aianalyst(
                     "shape": cleaned_json_df.shape,
                     "columns": list(cleaned_json_df.columns),
                     "sample_data": cleaned_json_df.head(3).to_dict('records'),
-                    "description": "User-provided JSON file (converted, cleaned & formatted)",
+                    "description": f"User-provided JSON file: {json_file.filename} (converted, cleaned & formatted)",
                     "formatting_applied": formatting_json
                 }
                 print(f"📝 Provided JSON processed: {cleaned_json_df.shape} saved as {json_csv_name}")
@@ -1289,7 +1333,7 @@ async def aianalyst(
     # horizon_response = await ping_chatgpt(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
-    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+    gemini_response = await ping_gemini_pro(context, "You are a great Python code developer. application/json, JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
     raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
 
     
@@ -1394,7 +1438,7 @@ async def aianalyst(
                 "                    If a function call results in a type mismatch, either cast to the required type or choose an alternative function that directly returns the needed value."
                 "4. DO NOT create imaginary answers - process actual data\n" +
                 "5. Ensure final output is valid JSON using json.dumps()\n" +
-                "6. Make the code complete and executable\n\n" +
+                "6. Make the code complete and executable\n\n"  +
                 "COMMON FIXES NEEDED:\n" +
                 "- Replace placeholder URLs with actual ones from data_summary\n" +
                 "- Fix file path references to match available files\n" +

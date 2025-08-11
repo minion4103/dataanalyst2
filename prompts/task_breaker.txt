@@ -22,3 +22,4 @@ EXAMPLE OUTPUT:
 4. Return company names and revenue values
 
 Your breakdown should start directly with data filtering, sorting, or calculations.
+REMEMBER : return format should be only application/json.
