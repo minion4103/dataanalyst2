@@ -30,7 +30,7 @@ app = FastAPI()
 load_dotenv()
 
 # --- Precise file tracking & cleanup helpers ---
-def _snapshot_files(root: str = ".") -> set[str]:
+def _snapshot_files(root: str = "/tmp") -> set[str]:
     """Get a snapshot of all files under root as relative paths."""
     files = set()
     for dirpath, dirnames, filenames in os.walk(root):
@@ -52,7 +52,7 @@ def _cleanup_created_files(files_to_delete: set[str]) -> int:
             path = os.path.normpath(rel_path)
             # handle paths that might already be absolute
             if not os.path.isabs(path):
-                path = os.path.join(".", path) if path != "." else "."
+                path = os.path.join("/tmp", path) if path != "/tmp" else "/tmp"
             if os.path.isfile(path):
                 os.remove(path)
                 deleted += 1
@@ -118,7 +118,6 @@ def make_json_serializable(obj):
 # --- Safe file writing to avoid Windows cp1252 'charmap' UnicodeEncodeErrors ---
 def safe_write(path: str, text: str, replace: bool = True):
     """Write text to file using UTF-8 regardless of system locale.
-
     Windows default (cp1252) cannot encode characters like U+2011 (non-breaking hyphen)
     or U+202F (narrow no-break space) sometimes produced by LLM outputs. This helper
     forces utf-8 and optionally replaces unencodable characters.
@@ -228,7 +227,7 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
 @functools.lru_cache(maxsize=10)
 def read_prompt_file(filename: str, default: str = "") -> str:
     try:
-        with open(filename, encoding="utf-8") as f:
+        with open(os.path.join("/app", filename), encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         print(f"⚠️ Prompt file not found: {filename}. Using default content.")
@@ -574,10 +573,10 @@ async def scrape_all_urls(urls: list) -> list:
                         else:  # Subsequent URLs
                             filename = f"{safe_table_name}_url{i+1}_{j+1}.csv"
                         
-                        df.to_csv(filename, index=False, encoding="utf-8")
+                        df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
                         
                         scraped_data.append({
-                            "filename": filename,
+                            "filename": f"/tmp/{filename}",
                             "source_url": url,
                             "table_name": table_name,
                             "shape": table_data["shape"],
@@ -593,10 +592,10 @@ async def scrape_all_urls(urls: list) -> list:
                 
                 if not df.empty:
                     filename = f"data{i+1}.csv" if i > 0 else "data.csv"
-                    df.to_csv(filename, index=False, encoding="utf-8")
+                    df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
                     
                     scraped_data.append({
-                        "filename": filename,
+                        "filename": f"/tmp/{filename}",
                         "source_url": url,
                         "shape": df.shape,
                         "columns": list(df.columns)
@@ -659,7 +658,7 @@ async def process_pdf_files() -> list:
     pdf_data = []
     
     # Find all PDF files in current directory
-    pdf_files = glob.glob("*.pdf")
+    pdf_files = glob.glob("/tmp/*.pdf")
     if not pdf_files:
         print("📄 No PDF files found in current directory")
         return pdf_data
@@ -818,10 +817,10 @@ async def process_pdf_files() -> list:
                 csv_filename = f"combined_{clean_name[:20]}.csv"
             
             # Save the merged data directly (no processing)
-            merged_df.to_csv(csv_filename, index=False, encoding="utf-8")
+            merged_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
             
             table_info = {
-                "filename": csv_filename,
+                "filename": f"/tmp/{csv_filename}",
                 "source_pdfs": list(set(source_pdfs)),
                 "table_count": len(raw_tables_in_group),
                 "shape": merged_df.shape,
@@ -842,10 +841,10 @@ async def process_pdf_files() -> list:
             for idx, table_meta in enumerate(raw_tables_in_group):
                 raw_df = table_meta["raw_dataframe"]
                 csv_filename = f"fallback_{group_name}_table_{idx+1}.csv"
-                raw_df.to_csv(csv_filename, index=False, encoding="utf-8")
+                raw_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
                 
                 table_info = {
-                    "filename": csv_filename,
+                    "filename": f"/tmp/{csv_filename}",
                     "source_pdfs": [table_meta["source_pdf"]],
                     "table_count": 1,
                     "shape": raw_df.shape,
@@ -1042,7 +1041,7 @@ async def aianalyst(request: Request):
  
     time_start = time.time()
     # Track files created during this request
-    initial_snapshot = _snapshot_files(".")
+    initial_snapshot = _snapshot_files("/tmp")
     created_files: set[str] = set()
     
     # Initialize file type variables
@@ -1150,7 +1149,7 @@ async def aianalyst(request: Request):
     
     if archive_files:
         # Create a temporary directory for extraction
-        temp_dir = tempfile.mkdtemp(prefix="archive_extract_")
+        temp_dir = tempfile.mkdtemp(prefix="archive_extract_", dir="/tmp")
         created_files.add(temp_dir)  # Track for cleanup
         
         try:
@@ -1234,9 +1233,9 @@ async def aianalyst(request: Request):
         task_breaked = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         task_breaked = f"1. Read question (Task breaker fallback due to error: {e})"  # fallback minimal content
-    with open("broken_down_tasks.txt", "w", encoding="utf-8") as f:
+    with open("/tmp/broken_down_tasks.txt", "w", encoding="utf-8") as f:
         f.write(str(task_breaked))
-    created_files.add(os.path.normpath("broken_down_tasks.txt"))
+    created_files.add(os.path.normpath("/tmp/broken_down_tasks.txt"))
 
     # Proceed with remaining steps (CSV/HTML/JSON processing, source extraction, etc.)
     # ----------------------------------------------------------------------
@@ -1253,11 +1252,12 @@ async def aianalyst(request: Request):
             cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(csv_df)
             
             # Save as ProvidedCSV.csv
-            cleaned_df.to_csv("ProvidedCSV.csv", index=False, encoding="utf-8")
-            created_files.add(os.path.normpath("ProvidedCSV.csv"))
+            cleaned_df.to_csv("/tmp/ProvidedCSV.csv", index=False, encoding="utf-8")
+            created_files.add(os.path.normpath("/tmp/ProvidedCSV.csv"))
+
             
             provided_csv_info = {
-                "filename": "ProvidedCSV.csv",
+                "filename": "/tmp/ProvidedCSV.csv",
                 "shape": cleaned_df.shape,
                 "columns": list(cleaned_df.columns),
                 "sample_data": cleaned_df.head(3).to_dict('records'),
@@ -1283,11 +1283,11 @@ async def aianalyst(request: Request):
             
             # Save with unique name
             output_name = f"ExtractedCSV_{i+1}.csv"
-            cleaned_df.to_csv(output_name, index=False, encoding="utf-8")
-            created_files.add(os.path.normpath(output_name))
-            
+            cleaned_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
+            created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+
             csv_info = {
-                "filename": output_name,
+                "filename": f"/tmp/{output_name}",
                 "shape": cleaned_df.shape,
                 "columns": list(cleaned_df.columns),
                 "sample_data": cleaned_df.head(3).to_dict('records'),
@@ -1313,10 +1313,11 @@ async def aianalyst(request: Request):
             if df_html is not None and not df_html.empty:
                 cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
                 html_csv_name = "ProvidedHTML.csv"
-                cleaned_html_df.to_csv(html_csv_name, index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(html_csv_name))
+                cleaned_html_df.to_csv(f"/tmp/{html_csv_name}", index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(f"/tmp/{html_csv_name}"))
+
                 provided_html_info = {
-                    "filename": html_csv_name,
+                    "filename": f"/tmp/{html_csv_name}",
                     "shape": cleaned_html_df.shape,
                     "columns": list(cleaned_html_df.columns),
                     "sample_data": cleaned_html_df.head(3).to_dict('records'),
@@ -1343,11 +1344,11 @@ async def aianalyst(request: Request):
             if df_html is not None and not df_html.empty:
                 cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
                 output_name = f"ExtractedHTML_{i+1}.csv"
-                cleaned_html_df.to_csv(output_name, index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(output_name))
-                
+                cleaned_html_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+
                 html_info = {
-                    "filename": output_name,
+                    "filename": f"/tmp/{output_name}",
                     "shape": cleaned_html_df.shape,
                     "columns": list(cleaned_html_df.columns),
                     "sample_data": cleaned_html_df.head(3).to_dict('records'),
@@ -1403,10 +1404,11 @@ async def aianalyst(request: Request):
                 sourcer = data_scrape.ImprovedWebScraper()
                 cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
                 json_csv_name = "ProvidedJSON.csv"
-                cleaned_json_df.to_csv(json_csv_name, index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(json_csv_name))
+                cleaned_json_df.to_csv(f"/tmp/{json_csv_name}", index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(f"/tmp/{json_csv_name}"))
+
                 provided_json_info = {
-                    "filename": json_csv_name,
+                    "filename": f"/tmp/{json_csv_name}",
                     "shape": cleaned_json_df.shape,
                     "columns": list(cleaned_json_df.columns),
                     "sample_data": cleaned_json_df.head(3).to_dict('records'),
@@ -1464,11 +1466,11 @@ async def aianalyst(request: Request):
                 sourcer = data_scrape.ImprovedWebScraper()
                 cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
                 output_name = f"ExtractedJSON_{i+1}.csv"
-                cleaned_json_df.to_csv(output_name, index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(output_name))
-                
+                cleaned_json_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+
                 json_info = {
-                    "filename": output_name,
+                    "filename": f"/tmp/{output_name}",
                     "shape": cleaned_json_df.shape,
                     "columns": list(cleaned_json_df.columns),
                     "sample_data": cleaned_json_df.head(3).to_dict('records'),
@@ -1492,26 +1494,26 @@ async def aianalyst(request: Request):
             
             # Save uploaded PDF temporarily
             temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
-            with open(temp_pdf_filename, "wb") as f:
+            with open(f"/tmp/{temp_pdf_filename}", "wb") as f:
                 f.write(pdf_content)
-            created_files.add(os.path.normpath(temp_pdf_filename))
+            created_files.add(os.path.normpath(f"/tmp/{temp_pdf_filename}"))                                                                                            
             
             print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
 
             # Extract tables (raw) then group & merge by header before any CSV creation
             try:
                 tables = tabula.read_pdf(
-                    temp_pdf_filename,
-                    pages='all',
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,
-                    silent=True
-                )
+                f"/tmp/{temp_pdf_filename}",
+                pages='all',
+                multiple_tables=True,
+                pandas_options={'header': 'infer'},
+                lattice=True,
+                silent=True
+            )
                 if not tables or all(df.empty for df in tables):
                     print("📄 Retrying with stream method...")
                     tables = tabula.read_pdf(
-                        temp_pdf_filename,
+                        f"/tmp/{temp_pdf_filename}",
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
@@ -1574,11 +1576,11 @@ async def aianalyst(request: Request):
                         safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
                         csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
 
-                    cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
-                    created_files.add(os.path.normpath(csv_filename))
+                    cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
+                    created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
                     table_info = {
-                        "filename": csv_filename,
-                        "source_pdf": temp_pdf_filename,
+                        "filename": f"/tmp/{csv_filename}",  # Add this
+                        "source_pdf": f"/tmp/{temp_pdf_filename}",
                         "table_number": g_idx,
                         "merged_from_tables": [t["table_number"] for t in grp["tables"]],
                         "page_table_count": len(grp["tables"]),
@@ -1645,11 +1647,11 @@ async def aianalyst(request: Request):
                     formatting_results = {}
 
                 csv_filename = f"ExtractedPDF_{i+1}_table_{j+1}.csv"
-                cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(csv_filename))
-                
+                cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
+
                 table_info = {
-                    "filename": csv_filename,
+                    "filename": f"/tmp/{csv_filename}",
                     "source_pdf": pdf_file_path,
                     "table_number": j + 1,
                     "shape": cleaned_df.shape,
@@ -1706,22 +1708,25 @@ async def aianalyst(request: Request):
     database_files_to_process = []
     if provided_csv_info:
         database_files_to_process.append({
-            "url": provided_csv_info.get("filename", "ProvidedCSV.csv"),
+            "url": provided_csv_info.get("filename", "/tmp/ProvidedCSV.csv"),
             "format": "csv",
             "description": provided_csv_info.get("description", "User-provided CSV file (cleaned and formatted)"),
         })
+
     if provided_html_info:
         database_files_to_process.append({
-            "url": provided_html_info.get("filename", "ProvidedHTML.csv"),
+            "url": provided_html_info.get("filename", "/tmp/ProvidedHTML.csv"),
             "format": "csv",
             "description": provided_html_info.get("description", "User-provided HTML file (cleaned and formatted)"),
         })
+
     if provided_json_info:
         database_files_to_process.append({
-            "url": provided_json_info.get("filename", "ProvidedJSON.csv"),
+            "url": provided_json_info.get("filename", "/tmp/ProvidedJSON.csv"),
             "format": "csv",
             "description": provided_json_info.get("description", "User-provided JSON file (cleaned and formatted)"),
         })
+
     
     # Add extracted files from archives to database processing
     for csv_info in extracted_csv_data:
@@ -1779,9 +1784,9 @@ async def aianalyst(request: Request):
     )
     
     # Save data summary for debugging
-    with open("data_summary.json", "w", encoding="utf-8") as f:
+    with open("/tmp/data_summary.json", "w", encoding="utf-8") as f:
         json.dump(make_json_serializable(data_summary), f, indent=2)
-    created_files.add(os.path.normpath("data_summary.json"))
+    created_files.add(os.path.normpath("/tmp/data_summary.json"))
 
     print(f"📋 Data Summary: {data_summary['total_sources']} total sources")
 
@@ -1810,10 +1815,9 @@ async def aianalyst(request: Request):
     # Validate Grok response structure before trying to index
     try:
         gemini_response =  await ping_gemini_pro(context, "You are a great Python code developer. you code should print answer in only , JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-        print(json.dumps(gemini_response, indent=2, ensure_ascii=False))
+
         raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        print(e)
         fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
 
         return JSONResponse(
@@ -1839,16 +1843,16 @@ async def aianalyst(request: Request):
     cleaned_code = '\n'.join(clean_lines).strip()
 
     # Write generated code using UTF-8 to avoid Windows cp1252 encode errors (e.g. for narrow no-break space \u202f)
-    with open("chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
+    with open("/tmp/chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
         f.write(cleaned_code)
-    created_files.add(os.path.normpath("chatgpt_code.py"))
+    created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
 
     # Execute the code
     try:
         # Snapshot before executing generated code to catch any new files it creates
-        pre_exec_snapshot = _snapshot_files(".")
+        pre_exec_snapshot = _snapshot_files("/tmp")
         result = subprocess.run(
-            ["python", "chatgpt_code.py"],
+            ["python", "/tmp/chatgpt_code.py"],
             capture_output=True,
             text=True,
             timeout=120
@@ -1864,7 +1868,7 @@ async def aianalyst(request: Request):
                     print("✅ Code executed successfully")
                     
                     # Cleanup generated files before returning
-                    post_exec_snapshot = _snapshot_files(".")
+                    post_exec_snapshot = _snapshot_files("/tmp")
                     new_files = post_exec_snapshot - pre_exec_snapshot
                     files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
                     _cleanup_created_files(files_to_delete)
@@ -1898,14 +1902,14 @@ async def aianalyst(request: Request):
         print(f"🔧 Attempting to fix code (attempt {fix_attempt}/{max_fix_attempts})")
         
         try:
-            with open("chatgpt_code.py", "r", encoding="utf-8") as code_file:
+            with open("/tmp/chatgpt_code.py", "r", encoding="utf-8") as code_file:
                 code_content = code_file.read()
             
             try:
                 # Snapshot for this fix attempt
-                fix_pre_exec_snapshot = _snapshot_files(".")
+                fix_pre_exec_snapshot = _snapshot_files("/tmp")
                 result = subprocess.run(
-                    ["python", "chatgpt_code.py"],
+                    ["python", "/tmp/chatgpt_code.py"],
                     capture_output=True,
                     text=True,
                     timeout=120
@@ -1943,12 +1947,19 @@ async def aianalyst(request: Request):
                 "Return ONLY the corrected Python code (no markdown, no explanations):"
             )
             # Write fix prompt safely (avoid cp1252 encoding errors on Windows)
-            safe_write("fix.txt", fix_prompt)
+            safe_write("/tmp/fix.txt", fix_prompt)
 
-            # horizon_fix = await fix_with_grok(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            # horizon_fix = await ping_horizon(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
             # fixed_code = horizon_fix["choices"][0]["message"]["content"]
+
+
+            # gemini_fix = await ping_chatgpt(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            # fixed_code = gemini_fix["choices"][0]["message"]["content"]
+
+
             gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
             fixed_code = gemini_fix["candidates"][0]["content"]["parts"][0]["text"]
+
 
             # Clean the fixed code
             lines = fixed_code.split('\n')
@@ -1964,14 +1975,14 @@ async def aianalyst(request: Request):
 
             cleaned_fixed_code = '\n'.join(clean_lines).strip()
             
-            with open("chatgpt_code.py", "w", encoding="utf-8") as code_file:
+            with open("/tmp/chatgpt_code.py", "w", encoding="utf-8") as code_file:
                 code_file.write(cleaned_fixed_code)
-            created_files.add(os.path.normpath("chatgpt_code.py"))
+            created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
 
             # Test the fixed code
             # Track any new files produced by retries as well
             result = subprocess.run(
-                ["python", "chatgpt_code.py"],
+                ["python", "/tmp/chatgpt_code.py"],
                 capture_output=True,
                 text=True,
                 timeout=120
@@ -1987,7 +1998,7 @@ async def aianalyst(request: Request):
                         print(f"✅ Code fixed and executed successfully on fix attempt {fix_attempt}")
                         
                         # Cleanup generated files before returning
-                        post_exec_snapshot = _snapshot_files(".")
+                        post_exec_snapshot = _snapshot_files("/tmp")
                         # Prefer fix attempt snapshot if present
                         new_files = post_exec_snapshot - (fix_pre_exec_snapshot if 'fix_pre_exec_snapshot' in locals() else pre_exec_snapshot)
                         files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
@@ -2017,10 +2028,10 @@ async def aianalyst(request: Request):
     print("❌ All code execution attempts failed")
     
     # Cleanup generated files before returning error
-    final_snapshot = _snapshot_files(".")
+    final_snapshot = _snapshot_files("/tmp")
     new_files = final_snapshot - initial_snapshot
     files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-    fake_answer = ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
+    fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
     _cleanup_created_files(files_to_delete)
 
     return JSONResponse(
