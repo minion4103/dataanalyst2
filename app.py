@@ -2038,7 +2038,7 @@ async def aianalyst(request: Request):
     return JSONResponse(
             content={
                 "success": "code executed successfully and answers are confirmed to be correct",
-                "answers": fake_answer["candidates"][0]["content"]["parts"][0]["text"],
+                "answers": fake_answer["choices"][0]["message"]["content"],
             },
         media_type="application/json"
     )
