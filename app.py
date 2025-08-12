@@ -290,6 +290,38 @@ async def ping_chatgpt(question_text, relevant_context, max_tries=3):
             tries += 1
             continue
 
+
+async def ping_horizon(question_text, relevant_context="", max_tries=3):
+    tries = 0
+    while tries < max_tries:
+        try:
+            print(f"horizon is running {tries + 1} try")
+            headers = {
+                "Authorization": f"Bearer {horizon_api}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "openrouter/horizon-beta",
+                "messages": [
+                    {"role": "system", "content": relevant_context},
+                    {"role": "user", "content": question_text}
+                ]
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Error during Horizon call: {e}")
+            tries += 1
+    return {"error": "Horizon failed after max retries"}
+
+
+
 async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
     """Call Gemini Pro API for code generation."""    
     tries = 0
@@ -1773,7 +1805,7 @@ async def aianalyst(request: Request):
         "DATA SUMMARY: " + json.dumps(make_json_serializable(data_summary), indent=2)
     )
 
-    # horizon_response = await ping_chatgpt(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
+    # horizon_response = await ping_horizon(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
     try:
