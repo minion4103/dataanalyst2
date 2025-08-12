@@ -136,4 +136,3 @@ REMEMBER: The database is your calculator - use it to compute the answer, don't 
 REMEMBER: When creating code and using any library always make sure the keyword you use exist or not example: matplotlib.pyplot.savefig() dont have a keyword quality for WEBP format 
 REMEMBER: When writing SQL queries, always make take precautions for special columns like date time to reduce error chance aim for precision and efficiency.
 
-CRITICAL: you code should print answer in  application/json only
