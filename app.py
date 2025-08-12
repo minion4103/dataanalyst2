@@ -1810,9 +1810,10 @@ async def aianalyst(request: Request):
     # Validate Grok response structure before trying to index
     try:
         gemini_response =  await ping_gemini_pro(context, "You are a great Python code developer. you code should print answer in only , JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-
+        print(json.dumps(gemini_response, indent=2, ensure_ascii=False))
         raw_code = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
+        print(e)
         fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
 
         return JSONResponse(
