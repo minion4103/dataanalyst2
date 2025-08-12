@@ -262,8 +262,12 @@ async def ping_gemini(question_text, relevant_context="", max_tries=3):
                 response.raise_for_status()
                 return response.json()
         except Exception as e:
-            print(f"Error during Gemini call: {e}")
+            print(f"Error during Gemini call (attempt {tries + 1}): {e}")
             tries += 1
+            if tries < max_tries:
+                print(f"Retrying... ({max_tries - tries} attempts remaining)")
+            else:
+                print(f"All {max_tries} attempts failed for Gemini")
     return {"error": "Gemini failed after max retries"}
 
 async def ping_chatgpt(question_text, relevant_context, max_tries=3):
@@ -349,10 +353,25 @@ async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
             async with httpx.AsyncClient(timeout=120) as client:
                 response = await client.post("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent", headers=headers, json=payload)
                 print(response)
-                return response.json()
+                
+                # Check if response is successful
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    print(f"Gemini Pro API error: {response.status_code} - {response.text}")
+                    if response.status_code >= 500:  # Server errors, retry
+                        raise Exception(f"Server error {response.status_code}: {response.text}")
+                    else:  # Client errors, don't retry
+                        return {"error": f"Client error {response.status_code}: {response.text}"}
+                        
         except Exception as e:
-            print(f"Error creating payload: {e}")
+            print(f"Error in Gemini Pro API call (attempt {tries + 1}): {e}")
             tries += 1
+            if tries < max_tries:
+                print(f"Retrying... ({max_tries - tries} attempts remaining)")
+            else:
+                print(f"All {max_tries} attempts failed for Gemini Pro")
+                return {"error": f"Failed after {max_tries} attempts: {str(e)}"}
 
 
 

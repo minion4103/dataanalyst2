@@ -68,8 +68,12 @@ async def ping_gemini(question_text, relevant_context="", max_tries=3):
                     raise Exception(f"Invalid JSON response: {json_error}")
                     
         except Exception as e:
-            print(f"Error during Gemini call: {e}")
+            print(f"Error during Gemini call (attempt {tries + 1}): {e}")
             tries += 1
+            if tries < max_tries:
+                print(f"Retrying... ({max_tries - tries} attempts remaining)")
+            else:
+                print(f"All {max_tries} attempts failed for Gemini")
     return {"error": "Gemini failed after max retries"}
 
 class NumericFieldFormatter:
