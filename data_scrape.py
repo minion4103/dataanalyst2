@@ -614,12 +614,37 @@ class WebScraper:
                 content = await page.content()
                 await browser.close()
                 
-                # Check if we got blocked/access denied
+                # Check if we got blocked/access denied (improved detection)
                 content_lower = content.lower()
-                blocked_indicators = ['access denied', 'blocked', 'forbidden', 'captcha', 'robot', 
-                                    'you don\'t have permission', 'reference #']
                 
-                if any(indicator in content_lower for indicator in blocked_indicators):
+                # More specific blocking indicators
+                blocked_indicators = [
+                    'access denied',
+                    'you don\'t have permission to access',
+                    '403 forbidden',
+                    'this site is blocked',
+                    'your request has been blocked',
+                    'cloudflare ray id',
+                    'please enable javascript and cookies',
+                    'human verification',
+                    'please complete the security check'
+                ]
+                
+                # Check for blocking only with more context
+                is_blocked = False
+                if len(content) < 1000:  # Short content might be error page
+                    is_blocked = any(indicator in content_lower for indicator in blocked_indicators)
+                else:
+                    # For longer content, only check for very specific blocking messages
+                    specific_blocks = [
+                        'access denied',
+                        'you don\'t have permission to access',
+                        '403 forbidden',
+                        'cloudflare ray id'
+                    ]
+                    is_blocked = any(indicator in content_lower for indicator in specific_blocks)
+                
+                if is_blocked:
                     print("❌ Playwright got blocked/access denied page")
                     raise Exception("Access denied - page blocked by server")
                 
@@ -630,17 +655,27 @@ class WebScraper:
                 raise Exception(f"Failed to fetch {url}: {str(e)}")
     
     async def extract_table_from_html(self, html_content: str) -> pd.DataFrame:
-        """Extract the best table from HTML content using LLM guidance"""
-        # First, let LLM analyze the HTML structure and suggest extraction strategy
-        extraction_strategy = await self._get_llm_extraction_strategy(html_content)
-        
-        if extraction_strategy.get("method") == "pandas_direct":
-            return await self._pandas_extraction_with_llm_guidance(html_content, extraction_strategy)
-        elif extraction_strategy.get("method") == "beautifulsoup_guided":
-            return await self._beautifulsoup_extraction_with_llm_guidance(html_content, extraction_strategy)
-        else:
-            # Fallback to traditional methods
-            return await self._fallback_extraction(html_content)
+        """Extract the best table from HTML content using LLM guidance with fallbacks"""
+        try:
+            # First, let LLM analyze the HTML structure and suggest extraction strategy
+            extraction_strategy = await self._get_llm_extraction_strategy(html_content)
+            
+            if extraction_strategy.get("method") == "pandas_direct":
+                return await self._pandas_extraction_with_llm_guidance(html_content, extraction_strategy)
+            elif extraction_strategy.get("method") == "beautifulsoup_guided":
+                return await self._beautifulsoup_extraction_with_llm_guidance(html_content, extraction_strategy)
+            else:
+                # Fallback to traditional methods
+                return await self._fallback_extraction(html_content)
+                
+        except Exception as e:
+            print(f"❌ LLM-guided extraction failed: {e}")
+            print("🔄 Falling back to traditional extraction methods...")
+            try:
+                return await self._fallback_extraction(html_content)
+            except Exception as e2:
+                print(f"❌ Fallback extraction also failed: {e2}")
+                raise Exception(f"All extraction methods failed. Guided: {e}, Fallback: {e2}")
     
     
     async def _get_llm_extraction_strategy(self, html_content: str) -> Dict[str, Any]:
@@ -1628,17 +1663,47 @@ class WebScraper:
         soup = BeautifulSoup(html_content, 'html.parser')
         table_indicators = strategy.get("table_indicators", {})
         
-        # Find tables using LLM-suggested selector
-        selector = table_indicators.get("best_table_selector", "table")
+        # Find tables using LLM-suggested selector with fallback
+        suggested_selector = table_indicators.get("best_table_selector", "table")
+        tables = []
         
-        if "." in selector and not selector.startswith("."):
-            # Handle class-based selectors
-            tables = soup.select(selector)
-        else:
+        # Try LLM-suggested selector first
+        if suggested_selector and suggested_selector != "table":
+            print(f"🎯 Trying LLM-suggested selector: {suggested_selector}")
+            if "." in suggested_selector and not suggested_selector.startswith("."):
+                # Handle class-based selectors
+                tables = soup.select(suggested_selector)
+            else:
+                tables = soup.find_all(suggested_selector)
+        
+        # Fallback to generic table search if no tables found
+        if not tables:
+            print("🔄 LLM selector failed, falling back to generic table search...")
             tables = soup.find_all('table')
+            
+            # If still no tables, try more specific selectors
+            if not tables:
+                print("🔄 Trying alternative table selectors...")
+                # Try common table patterns
+                alternative_selectors = [
+                    'table.wikitable',
+                    'table[class*="table"]',
+                    'div[class*="table"] table',
+                    '.wikitable',
+                    '[class*="result"] table',
+                    '.standings table'
+                ]
+                
+                for alt_selector in alternative_selectors:
+                    tables = soup.select(alt_selector)
+                    if tables:
+                        print(f"✅ Found tables with selector: {alt_selector}")
+                        break
         
         if not tables:
-            raise Exception(f"No tables found with selector: {selector}")
+            raise Exception(f"No tables found on page. Tried selector: {suggested_selector} and fallback methods")
+        
+        print(f"📊 Found {len(tables)} table(s) on page")
         
         # Score and select best table
         best_table = self._score_and_select_table(tables, strategy)
@@ -1932,7 +1997,7 @@ class WebScraper:
         return df
     
     async def fetch_webpage_with_session(self, url: str) -> str:
-        """Fetch webpage using session method (works for various websites)"""
+        """Fetch webpage using session method with enhanced cookie collection"""
         try:
             print("🍪 Getting cookies from base domain...")
             
@@ -1946,19 +2011,49 @@ class WebScraper:
             print(f"Homepage status: {homepage_response.status_code}")
             print(f"Cookies received: {len(self.session.cookies)}")
             
-            # Wait a bit between requests
+            # Wait a bit between requests to seem more human-like
             time.sleep(2)
             
             # Now fetch the actual URL
-            print(f"🌐 Fetching {url} with session...")
+            print(f"🌐 Fetching {url} with session and cookies...")
             response = self.session.get(url, timeout=30)
             print(f"Target page status: {response.status_code}")
             
             if response.status_code == 200:
-                # Check if we got blocked
-                if 'access denied' in response.text.lower():
-                    print("❌ Still getting access denied with session method")
-                    raise Exception("Access denied even with session method")
+                # Check if we got blocked or access denied (more specific detection)
+                content_lower = response.text.lower()
+                
+                # More specific blocking indicators that are less likely to be false positives
+                blocked_indicators = [
+                    'access denied', 
+                    'you don\'t have permission to access',
+                    '403 forbidden',
+                    'this site is blocked',
+                    'your request has been blocked',
+                    'cloudflare ray id',
+                    'please enable javascript and cookies',
+                    'human verification',
+                    'please complete the security check'
+                ]
+                
+                # Check for blocking only if we have very specific indicators
+                # AND the content is suspiciously short (likely an error page)
+                is_blocked = False
+                if len(response.text) < 1000:  # Error pages are usually short
+                    is_blocked = any(indicator in content_lower for indicator in blocked_indicators)
+                else:
+                    # For longer content, only check for very specific blocking messages
+                    specific_blocks = [
+                        'access denied',
+                        'you don\'t have permission to access',
+                        '403 forbidden',
+                        'cloudflare ray id'
+                    ]
+                    is_blocked = any(indicator in content_lower for indicator in specific_blocks)
+                
+                if is_blocked:
+                    print("❌ Access denied with session method - got blocked page")
+                    raise Exception("Access denied - session method blocked by server")
                 
                 print("✅ Successfully fetched webpage with session method")
                 return response.text
@@ -1967,8 +2062,8 @@ class WebScraper:
                 
         except Exception as e:
             print(f"❌ Session method failed: {e}")
-            # Fallback to playwright method
-            return await self.fetch_webpage(url)
+            # Let the caller handle fallback strategy
+            raise e
 
 class ImprovedWebScraper:
     """Main class that coordinates web scraping and numeric formatting"""
@@ -2027,29 +2122,29 @@ class ImprovedWebScraper:
         }
     
     async def _smart_fetch_webpage(self, url: str) -> str:
-        """Try direct scraping first, use session method as fallback if direct fails"""
-        print("� Trying direct Playwright scraping first...")
+        """Try cookie-based session method first, fallback to Playwright if it fails"""
+        print("🍪 Trying cookie-based session scraping first...")
         
         try:
-            # Try regular method first
-            html_content = await self.web_scraper.fetch_webpage(url)
-            print("✅ Direct scraping successful")
+            # Try session method first (faster and less resource intensive)
+            html_content = await self.web_scraper.fetch_webpage_with_session(url)
+            print("✅ Cookie-based session scraping successful")
             return html_content
             
         except Exception as e:
-            print(f"❌ Direct method failed: {e}")
-            print("🔄 Falling back to session-based scraping...")
+            print(f"❌ Session method failed: {e}")
+            print("🔄 Falling back to Playwright scraping...")
             
             try:
-                # Fallback to session method
-                html_content = await self.web_scraper.fetch_webpage_with_session(url)
-                print("✅ Session-based scraping successful")
+                # Fallback to Playwright method
+                html_content = await self.web_scraper.fetch_webpage(url)
+                print("✅ Playwright scraping successful")
                 return html_content
                 
             except Exception as e2:
-                print(f"❌ Session method also failed: {e2}")
+                print(f"❌ Playwright method also failed: {e2}")
                 # Re-raise the original error
-                raise Exception(f"Both scraping methods failed. Direct: {e}, Session: {e2}")
+                raise Exception(f"Both scraping methods failed. Session: {e}, Playwright: {e2}")
         
     # Unreachable fallback removed
     

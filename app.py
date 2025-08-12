@@ -325,6 +325,7 @@ async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
 
 
 
+
 def extract_json_from_output(output: str) -> str:
     """Extract JSON from output that might contain extra text"""
     output = output.strip()
