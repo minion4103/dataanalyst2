@@ -1622,11 +1622,11 @@ class WebScraper:
         # Apply LLM-guided cleaning
         for clean_type in cleaning_needed:
             if clean_type == "references":
-                df_clean = df_clean.applymap(lambda x: re.sub(r'\[\d+\]', '', str(x)) if pd.notna(x) else x)
+                df_clean = df_clean.map(lambda x: re.sub(r'\[\d+\]', '', str(x)) if pd.notna(x) else x)
             elif clean_type == "special_chars":
-                df_clean = df_clean.applymap(lambda x: str(x).replace('\xa0', ' ').replace('\u2013', '-') if pd.notna(x) else x)
+                df_clean = df_clean.map(lambda x: str(x).replace('\xa0', ' ').replace('\u2013', '-') if pd.notna(x) else x)
             elif clean_type == "multiline":
-                df_clean = df_clean.applymap(lambda x: ' '.join(str(x).split()) if pd.notna(x) else x)
+                df_clean = df_clean.map(lambda x: ' '.join(str(x).split()) if pd.notna(x) else x)
         
         # Remove header-like rows based on skip patterns
         if skip_patterns or len(df_clean) > 5:
