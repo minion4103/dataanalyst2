@@ -91,9 +91,21 @@ openai_gpt5_url = "https://api.openai.com/v1/chat/completions"
 def make_json_serializable(obj):
     """Convert pandas/numpy objects to JSON-serializable formats"""
     if isinstance(obj, dict):
-        return {k: make_json_serializable(v) for k, v in obj.items()}
+        # Handle tuple keys by converting them to strings
+        result = {}
+        for k, v in obj.items():
+            if isinstance(k, tuple):
+                key = str(k)
+            elif k is None or isinstance(k, (str, int, float, bool)):
+                key = k
+            else:
+                key = str(k)
+            result[key] = make_json_serializable(v)
+        return result
     elif isinstance(obj, list):
         return [make_json_serializable(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return list(obj)  # Convert tuples to lists for JSON compatibility
     elif isinstance(obj, (pd.Series)):
         return make_json_serializable(obj.tolist())
     elif isinstance(obj, pd.DataFrame):
