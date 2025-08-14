@@ -141,6 +141,7 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
         'html_files': [],
         'image_files': [],
         'txt_files': [],
+        'sql_files': [],
         'other_files': []
     }
     
@@ -215,6 +216,8 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
                     extracted_files['image_files'].append(file_path)
                 elif filename_lower.endswith('.txt'):
                     extracted_files['txt_files'].append(file_path)
+                elif filename_lower.endswith('.sql'):
+                    extracted_files['sql_files'].append(file_path)
                 else:
                     extracted_files['other_files'].append(file_path)
         
@@ -1782,9 +1785,11 @@ def create_data_summary(csv_data: list,
                         pdf_data: list = None,
                         provided_html_info: dict = None,
                         provided_json_info: dict = None,
+                        provided_sql_info: dict = None,
                         extracted_csv_data: list = None,
                         extracted_html_data: list = None,
                         extracted_json_data: list = None,
+                        extracted_sql_data: list = None,
                         extracted_data_files: list = None) -> dict:
     """Create comprehensive data summary for LLM code generation.
     Extended to support optional provided HTML & JSON sources converted to CSV,
@@ -1795,13 +1800,15 @@ def create_data_summary(csv_data: list,
         "provided_csv": None,
         "provided_html": None,
         "provided_json": None,
+        "provided_sql": None,
         "scraped_data": [],
         "database_files": [],
         "pdf_extracted_tables": [],
         "extracted_from_archives": {
             "csv_files": [],
             "html_files": [],
-            "json_files": []
+            "json_files": [],
+            "sql_files": []
         },
         "extracted_from_text_images": [],  # New category for text/image extracted data
         "total_sources": 0,
@@ -1814,6 +1821,8 @@ def create_data_summary(csv_data: list,
         summary["provided_html"] = provided_html_info
     if provided_json_info:
         summary["provided_json"] = provided_json_info
+    if provided_sql_info:
+        summary["provided_sql"] = provided_sql_info
 
     # Add extracted data from archives
     if extracted_csv_data:
@@ -1822,6 +1831,8 @@ def create_data_summary(csv_data: list,
         summary["extracted_from_archives"]["html_files"] = extracted_html_data
     if extracted_json_data:
         summary["extracted_from_archives"]["json_files"] = extracted_json_data
+    if extracted_sql_data:
+        summary["extracted_from_archives"]["sql_files"] = extracted_sql_data
 
     # Add extracted data from text/images
     if extracted_data_files:
@@ -1834,7 +1845,7 @@ def create_data_summary(csv_data: list,
 
     # Compute unique total sources by identifiers (filenames/URLs)
     identifiers = set()
-    for info in [provided_csv_info, provided_html_info, provided_json_info]:
+    for info in [provided_csv_info, provided_html_info, provided_json_info, provided_sql_info]:
         if info and info.get("filename"):
             identifiers.add(os.path.normpath(info["filename"]))
     for item in csv_data or []:
@@ -1855,7 +1866,7 @@ def create_data_summary(csv_data: list,
             identifiers.add(os.path.normpath(pdf_file))
     
     # Add extracted data from archives
-    for extracted_list in [extracted_csv_data, extracted_html_data, extracted_json_data]:
+    for extracted_list in [extracted_csv_data, extracted_html_data, extracted_json_data, extracted_sql_data]:
         for item in extracted_list or []:
             fn = item.get("filename")
             if fn:
@@ -1900,6 +1911,7 @@ async def aianalyst(request: Request):
     csv_file = None
     html_file = None
     json_file = None
+    sql_file = None
     archive_files = []  # Support multiple archive files
     
     # Categorize files by extension (regardless of field name)
@@ -1924,6 +1936,9 @@ async def aianalyst(request: Request):
             elif filename_lower.endswith('.json'):
                 if json_file is None:  # Take first JSON file
                     json_file = file
+            elif filename_lower.endswith('.sql'):
+                if sql_file is None:  # Take first SQL file
+                    sql_file = file
             elif filename_lower.endswith(('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.zip', '.jar')):
                 archive_files.append(file)  # Collect all archive files
     
@@ -1934,6 +1949,7 @@ async def aianalyst(request: Request):
     if csv_file: print(f"  📊 CSV: {csv_file.filename}")
     if html_file: print(f"  🌐 HTML: {html_file.filename}")
     if json_file: print(f"  🗂️ JSON: {json_file.filename}")
+    if sql_file: print(f"  🗄️ SQL: {sql_file.filename}")
     if archive_files: print(f"  📦 Archives: {[f.filename for f in archive_files]}")
     
     # Handle questions text file
@@ -1966,7 +1982,8 @@ async def aianalyst(request: Request):
         'pdf_files': [],
         'html_files': [],
         'image_files': [],
-        'txt_files': []
+        'txt_files': [],
+        'sql_files': []
     }
     
     if archive_files:
@@ -2282,6 +2299,118 @@ async def aianalyst(request: Request):
         except Exception as e:
             print(f"❌ Error processing extracted JSON {json_file_path}: {e}")
 
+    # Handle provided SQL file
+    provided_sql_info = None
+    if sql_file:
+        try:
+            print("🗄️ Processing uploaded SQL file...")
+            sql_content = await sql_file.read()
+            sql_text = sql_content.decode("utf-8", errors="replace")
+            
+            # Save the SQL file to the workspace
+            sql_filename = f"ProvidedSQL_{sql_file.filename}"
+            safe_write(sql_filename, sql_text)
+            created_files.add(os.path.normpath(sql_filename))
+            
+            # Process the SQL file to extract schema information
+            sql_analysis = await process_sql_file(sql_filename)
+            
+            if sql_analysis["success"]:
+                # Create a summary file for the SQL schema
+                summary_filename = await create_sql_summary_file(
+                    {"schema": sql_analysis["schema"], "source_url": sql_file.filename, "sql_content_preview": sql_text[:1000]}, 
+                    f"sql_summary_{int(time.time())}.txt"
+                )
+                created_files.add(os.path.normpath(summary_filename))
+                
+                provided_sql_info = {
+                    "filename": sql_filename,
+                    "summary_file": summary_filename,
+                    "schema": sql_analysis["schema"],
+                    "total_tables": sql_analysis["schema"]["total_tables"],
+                    "description": f"User-provided SQL file: {sql_file.filename} (schema analyzed)",
+                    "sql_statements": sql_analysis["schema"]["sql_statements"]
+                }
+                
+                # Add to extracted data files list for data summary
+                extracted_data_files_list.append({
+                    "type": "sql_schema",
+                    "filename": sql_filename,
+                    "summary_file": summary_filename,
+                    "info": provided_sql_info
+                })
+                
+                print(f"📝 Provided SQL processed: {sql_analysis['schema']['total_tables']} tables found, saved as {sql_filename}")
+            else:
+                print(f"⚠️ Error analyzing SQL schema: {sql_analysis['error']}")
+                provided_sql_info = {
+                    "filename": sql_filename,
+                    "description": f"User-provided SQL file: {sql_file.filename} (schema analysis failed)",
+                    "error": sql_analysis["error"]
+                }
+                
+        except Exception as e:
+            print(f"❌ Error processing provided SQL: {e}")
+
+    # Process extracted SQL files from archives
+    extracted_sql_data = []
+    for i, sql_file_path in enumerate(extracted_from_archives.get('sql_files', [])):
+        try:
+            print(f"🗄️ Processing extracted SQL {i+1}: {os.path.basename(sql_file_path)}")
+            
+            # Copy to workspace with a proper name
+            output_sql_name = f"ExtractedSQL_{i+1}_{os.path.basename(sql_file_path)}"
+            with open(sql_file_path, 'r', encoding='utf-8', errors='replace') as f:
+                sql_text = f.read()
+            
+            safe_write(output_sql_name, sql_text)
+            created_files.add(os.path.normpath(output_sql_name))
+            
+            # Process the SQL file to extract schema information
+            sql_analysis = await process_sql_file(output_sql_name)
+            
+            if sql_analysis["success"]:
+                # Create a summary file for the SQL schema
+                summary_filename = await create_sql_summary_file(
+                    {"schema": sql_analysis["schema"], "source_url": sql_file_path, "sql_content_preview": sql_text[:1000]}, 
+                    f"extracted_sql_summary_{i+1}_{int(time.time())}.txt"
+                )
+                created_files.add(os.path.normpath(summary_filename))
+                
+                sql_info = {
+                    "filename": output_sql_name,
+                    "summary_file": summary_filename,
+                    "schema": sql_analysis["schema"],
+                    "total_tables": sql_analysis["schema"]["total_tables"],
+                    "description": f"SQL extracted from archive: {os.path.basename(sql_file_path)} (schema analyzed)",
+                    "sql_statements": sql_analysis["schema"]["sql_statements"],
+                    "source": "archive_extraction"
+                }
+                
+                extracted_sql_data.append(sql_info)
+                
+                # Add to extracted data files list for data summary
+                extracted_data_files_list.append({
+                    "type": "sql_schema",
+                    "filename": output_sql_name,
+                    "summary_file": summary_filename,
+                    "info": sql_info
+                })
+                
+                print(f"📝 Extracted SQL processed: {sql_analysis['schema']['total_tables']} tables found, saved as {output_sql_name}")
+            else:
+                print(f"⚠️ Error analyzing extracted SQL schema {sql_file_path}: {sql_analysis['error']}")
+                sql_info = {
+                    "filename": output_sql_name,
+                    "description": f"SQL extracted from archive: {os.path.basename(sql_file_path)} (schema analysis failed)",
+                    "error": sql_analysis["error"],
+                    "source": "archive_extraction"
+                }
+                extracted_sql_data.append(sql_info)
+                
+        except Exception as e:
+            print(f"❌ Error processing extracted SQL {sql_file_path}: {e}")
+
     # Step 3.5: Handle provided PDF file
     # Step 3.5: Handle provided PDF file (enhanced)
     uploaded_pdf_data = []
@@ -2588,9 +2717,11 @@ async def aianalyst(request: Request):
         pdf_data, 
         provided_html_info, 
         provided_json_info,
+        provided_sql_info,
         extracted_csv_data,
         extracted_html_data,
         extracted_json_data,
+        extracted_sql_data,
         extracted_data_files_list
     )
     
