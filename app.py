@@ -562,8 +562,15 @@ def extract_urls_with_regex(question_text: str) -> dict:
             continue
         
         # Check if it's a database file
-        if any(ext in clean_url.lower() for ext in ['.parquet', '.csv', '.json']):
-            format_type = "parquet" if ".parquet" in clean_url else "csv" if ".csv" in clean_url else "json"
+        if any(ext in clean_url.lower() for ext in ['.parquet', '.csv', '.json', '.sql']):
+            if ".parquet" in clean_url:
+                format_type = "parquet"
+            elif ".csv" in clean_url:
+                format_type = "csv"
+            elif ".sql" in clean_url:
+                format_type = "sql"
+            else:
+                format_type = "json"
             database_files.append({
                 "url": clean_url,
                 "format": format_type,
@@ -1176,25 +1183,38 @@ async def clean_and_structure_extracted_data(text_content: str, source_name: str
         if df is not None and not df.empty:
             print(f"📊 Successfully parsed data into DataFrame: {df.shape}")
             
+            # Handle duplicate column names which can cause issues
+            if len(df.columns) != len(set(df.columns)):
+                print("⚠️ Warning: Duplicate column names detected, renaming...")
+                df.columns = pd.Index([f"{col}_{i}" if list(df.columns).count(col) > 1 else col 
+                                     for i, col in enumerate(df.columns)])
+            
             # Apply basic cleaning using existing functions
             df = scraper._basic_clean_dataframe(df)
             
             # Try to clean numeric columns
             for col in df.columns:
-                if df[col].dtype == 'object':
-                    # Check if column contains numeric data
-                    sample_values = df[col].dropna().head(10)
-                    if any(re.search(r'\d', str(val)) for val in sample_values):
-                        try:
-                            # Try to determine numeric type and clean
-                            if any('$' in str(val) or 'USD' in str(val) for val in sample_values):
-                                df[col] = scraper._clean_currency_column(df[col])
-                            elif any('%' in str(val) for val in sample_values):
-                                df[col] = scraper._clean_percentage_column(df[col])
-                            else:
-                                df[col] = scraper._clean_generic_numeric_column(df[col])
-                        except:
-                            pass  # Keep original if cleaning fails
+                try:
+                    # Ensure we're working with a Series, not a DataFrame
+                    column_data = df[col]
+                    if hasattr(column_data, 'dtype') and column_data.dtype == 'object':
+                        # Check if column contains numeric data
+                        sample_values = column_data.dropna().head(10)
+                        if any(re.search(r'\d', str(val)) for val in sample_values):
+                            try:
+                                # Try to determine numeric type and clean
+                                if any('$' in str(val) or 'USD' in str(val) for val in sample_values):
+                                    df[col] = scraper._clean_currency_column(column_data)
+                                elif any('%' in str(val) for val in sample_values):
+                                    df[col] = scraper._clean_percentage_column(column_data)
+                                else:
+                                    df[col] = scraper._clean_generic_numeric_column(column_data)
+                            except Exception as clean_error:
+                                print(f"⚠️ Warning: Could not clean column '{col}': {clean_error}")
+                                pass  # Keep original if cleaning fails
+                except Exception as col_error:
+                    print(f"⚠️ Warning: Error processing column '{col}': {col_error}")
+                    continue
             
             return df
         
@@ -1452,7 +1472,170 @@ async def process_pdf_files() -> list:
     return pdf_data
 
 
-async def get_database_schemas(database_files: list) -> list:
+async def process_sql_file(file_path: str) -> dict:
+    """Process SQL file and extract schema information by analyzing SQL statements"""
+    try:
+        # Read the SQL file
+        if file_path.startswith('http'):
+            async with httpx.AsyncClient() as client:
+                response = await client.get(file_path)
+                sql_content = response.text
+        else:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                sql_content = f.read()
+        
+        # Basic SQL parsing to extract table information
+        sql_content = sql_content.upper()
+        
+        # Find CREATE TABLE statements - improved regex to capture complete table definitions
+        create_table_pattern = r'CREATE\s+TABLE\s+(\w+)\s*\((.*?)\);'
+        tables = re.findall(create_table_pattern, sql_content, re.DOTALL | re.IGNORECASE)
+        
+        schema_info = {
+            "tables": [],
+            "total_tables": len(tables),
+            "sql_statements": []
+        }
+        
+        for table_name, columns_str in tables:
+            # Parse column definitions
+            columns = []
+            column_types = {}
+            
+            # Split by comma and clean up - handle nested parentheses better
+            column_defs = []
+            paren_depth = 0
+            current_def = ""
+            
+            for char in columns_str:
+                if char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+                elif char == ',' and paren_depth == 0:
+                    column_defs.append(current_def.strip())
+                    current_def = ""
+                    continue
+                current_def += char
+            
+            if current_def.strip():
+                column_defs.append(current_def.strip())
+            
+            for col_def in column_defs:
+                col_def = col_def.strip()
+                if col_def:
+                    # Extract column name and type - handle various SQL syntax
+                    parts = col_def.split()
+                    if len(parts) >= 2:
+                        col_name = parts[0].strip('`"[]')
+                        col_type = parts[1].upper()
+                        
+                        # Skip constraint definitions that don't start with column names
+                        if col_name.upper() in ['PRIMARY', 'FOREIGN', 'CONSTRAINT', 'INDEX', 'KEY', 'UNIQUE', 'CHECK']:
+                            continue
+                            
+                        # Handle composite types like VARCHAR(255), DECIMAL(10,2)
+                        if len(parts) > 2 and '(' in parts[1]:
+                            col_type = ' '.join(parts[1:3]) if len(parts) > 2 else parts[1]
+                        columns.append(col_name)
+                        column_types[col_name] = col_type.upper()
+            
+            schema_info["tables"].append({
+                "table_name": table_name,
+                "columns": columns,
+                "column_types": column_types,
+                "total_columns": len(columns)
+            })
+        
+        # Extract other SQL statements (INSERT, SELECT examples, etc.)
+        statements = []
+        for line in sql_content.split(';'):
+            line = line.strip()
+            if line and not line.startswith('--'):
+                stmt_type = line.split()[0].upper() if line.split() else ""
+                if stmt_type in ['SELECT', 'INSERT', 'UPDATE', 'DELETE']:
+                    statements.append({
+                        "type": stmt_type,
+                        "statement": line[:200] + "..." if len(line) > 200 else line
+                    })
+        
+        schema_info["sql_statements"] = statements[:5]  # Limit to first 5 statements
+        
+        return {
+            "success": True,
+            "schema": schema_info,
+            "raw_content": sql_content[:1000] + "..." if len(sql_content) > 1000 else sql_content
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "schema": {"tables": [], "total_tables": 0, "sql_statements": []}
+        }
+
+
+async def create_sql_summary_file(sql_info: dict, output_filename: str = None) -> str:
+    """Create a comprehensive summary file for SQL schema information"""
+    if not output_filename:
+        output_filename = f"sql_summary_{int(time.time())}.txt"
+    
+    summary_content = []
+    summary_content.append("="*60)
+    summary_content.append("SQL DATABASE SCHEMA SUMMARY")
+    summary_content.append("="*60)
+    summary_content.append(f"Source: {sql_info.get('source_url', 'Unknown')}")
+    summary_content.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_content.append("")
+    
+    if 'sql_tables' in sql_info.get('schema', {}):
+        tables = sql_info['schema']['sql_tables']
+        summary_content.append(f"TOTAL TABLES: {len(tables)}")
+        summary_content.append(f"TOTAL COLUMNS: {sql_info.get('total_columns', 0)}")
+        summary_content.append("")
+        
+        for i, table in enumerate(tables, 1):
+            summary_content.append(f"{i}. TABLE: {table['table_name']}")
+            summary_content.append(f"   Columns: {table['total_columns']}")
+            summary_content.append("   Schema:")
+            
+            for col_name in table['columns']:
+                col_type = table['column_types'].get(col_name, 'UNKNOWN')
+                summary_content.append(f"     - {col_name}: {col_type}")
+            
+            summary_content.append("")
+    
+    # Add SQL statements preview
+    if 'sql_statements' in sql_info.get('schema', {}):
+        statements = sql_info['schema']['sql_statements']
+        if statements:
+            summary_content.append("EXAMPLE SQL STATEMENTS:")
+            summary_content.append("-" * 30)
+            for stmt in statements:
+                summary_content.append(f"{stmt['type']}: {stmt['statement']}")
+                summary_content.append("")
+    
+    # Add raw content preview
+    if 'sql_content_preview' in sql_info:
+        summary_content.append("SQL CONTENT PREVIEW:")
+        summary_content.append("-" * 30)
+        summary_content.append(sql_info['sql_content_preview'])
+        summary_content.append("")
+    
+    summary_content.append("="*60)
+    summary_content.append("END OF SQL SUMMARY")
+    summary_content.append("="*60)
+    
+    # Write summary to file
+    summary_text = "\n".join(summary_content)
+    with open(output_filename, 'w', encoding='utf-8') as f:
+        f.write(summary_text)
+    
+    print(f"📄 SQL summary saved to: {output_filename}")
+    return output_filename
+
+
+async def get_database_schemas(database_files: list, created_files: set = None) -> list:
     """Get schema and sample data from database files without loading full data"""
     database_info = []
     
@@ -1472,7 +1655,70 @@ async def get_database_schemas(database_files: list) -> list:
             
             print(f"📊 Getting schema for database {i+1}/{len(database_files)}: {url}")
             
-            # Build lightweight FROM/SELECT SQL and schema query (no data loading)
+            # Handle SQL files differently - parse the SQL content
+            if format_type == "sql" or ".sql" in url:
+                sql_result = await process_sql_file(url)
+                
+                if sql_result["success"]:
+                    sql_schema = sql_result["schema"]
+                    
+                    # Create a combined schema from all tables in the SQL file
+                    all_columns = []
+                    all_column_types = {}
+                    
+                    for table in sql_schema["tables"]:
+                        for col in table["columns"]:
+                            full_col_name = f"{table['table_name']}.{col}"
+                            all_columns.append(full_col_name)
+                            all_column_types[full_col_name] = table["column_types"].get(col, "UNKNOWN")
+                    
+                    schema_info = {
+                        "columns": all_columns,
+                        "column_types": all_column_types,
+                        "sql_tables": sql_schema["tables"],
+                        "total_tables": sql_schema["total_tables"],
+                        "sql_statements": sql_schema["sql_statements"]
+                    }
+                    
+                    # Create sample data from SQL statements or table info
+                    sample_data = []
+                    for table in sql_schema["tables"][:3]:  # Show first 3 tables as sample
+                        sample_data.append({
+                            "table_name": table["table_name"],
+                            "columns": ", ".join(table["columns"][:5]) + ("..." if len(table["columns"]) > 5 else ""),
+                            "total_columns": table["total_columns"]
+                        })
+                    
+                    database_info.append({
+                        "filename": f"sql_database_{i+1}",
+                        "source_url": url,
+                        "format": format_type,
+                        "schema": schema_info,
+                        "description": f"SQL file with {sql_schema['total_tables']} tables",
+                        "access_query": f"-- SQL file content from {url}",
+                        "from_clause": f"-- Tables: {', '.join([t['table_name'] for t in sql_schema['tables']])}",
+                        "preview_limit_sql": f"-- Preview of SQL file structure",
+                        "sample_data": sample_data,
+                        "total_columns": len(all_columns),
+                        "sql_content_preview": sql_result["raw_content"]
+                    })
+                    
+                    # Create and save SQL summary file
+                    sql_info_for_summary = database_info[-1]  # Get the just-added item
+                    summary_filename = f"sql_summary_{os.path.basename(url).replace('.sql', '')}.txt"
+                    await create_sql_summary_file(sql_info_for_summary, summary_filename)
+                    
+                    # Track created file
+                    if created_files is not None:
+                        created_files.add(os.path.normpath(summary_filename))
+                    
+                    print(f"✅ SQL schema extracted: {sql_schema['total_tables']} tables, {len(all_columns)} total columns")
+                else:
+                    print(f"❌ Failed to parse SQL file: {sql_result['error']}")
+                
+                continue  # Skip DuckDB processing for SQL files
+            
+            # Build lightweight FROM/SELECT SQL and schema query (no data loading) for other formats
             if format_type == "parquet" or "parquet" in url:
                 from_clause = f"read_parquet('{url}')"
                 base_select = f"SELECT * FROM {from_clause}"
@@ -2332,7 +2578,7 @@ async def aianalyst(request: Request):
             print(f"⏭️ Skipping invalid database file entry: {db}")
     if database_files_to_process:
         print(f"📊 Will process {len(database_files_to_process)} database files for schema extraction")
-        database_info = await get_database_schemas(database_files_to_process)
+        database_info = await get_database_schemas(database_files_to_process, created_files)
 
     # Step 7: Create comprehensive data summary
     data_summary = create_data_summary(
