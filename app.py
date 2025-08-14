@@ -2836,7 +2836,7 @@ async def aianalyst(request: Request):
         print(raw_code)
         # response = await ping_open_ai_5(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
         # raw_code = response["choices"][0]["message"]["content"]
-        print(raw_code)
+        # print(raw_code)
     except Exception as e:
         fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
 
