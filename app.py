@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, UploadFile, File, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,7 +26,8 @@ import tarfile
 import zipfile
 import tempfile
 import shutil
-import os
+
+import pdfplumber
 
 app = FastAPI()
 load_dotenv()
@@ -91,21 +93,9 @@ openai_gpt5_url = "https://api.openai.com/v1/chat/completions"
 def make_json_serializable(obj):
     """Convert pandas/numpy objects to JSON-serializable formats"""
     if isinstance(obj, dict):
-        # Handle tuple keys by converting them to strings
-        result = {}
-        for k, v in obj.items():
-            if isinstance(k, tuple):
-                key = str(k)
-            elif k is None or isinstance(k, (str, int, float, bool)):
-                key = k
-            else:
-                key = str(k)
-            result[key] = make_json_serializable(v)
-        return result
+        return {k: make_json_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [make_json_serializable(item) for item in obj]
-    elif isinstance(obj, tuple):
-        return list(obj)  # Convert tuples to lists for JSON compatibility
     elif isinstance(obj, (pd.Series)):
         return make_json_serializable(obj.tolist())
     elif isinstance(obj, pd.DataFrame):
@@ -735,6 +725,514 @@ def columns_match(cols1, cols2, threshold=0.6):
     print(f"   🔍 Column match ratio: {match_ratio:.2f} (threshold: {threshold}) = {'✅ MATCH' if result else '❌ NO MATCH'}")
     return result
 
+def looks_like_header(row):
+    """Enhanced heuristic: mostly non-empty strings, not numbers; short-ish cells."""
+    if not row or not isinstance(row, list):
+        return False
+    str_like = sum(1 for c in row if isinstance(c, str) and bool(re.search(r"[A-Za-z]", c or "")))
+    num_like = sum(1 for c in row if isinstance(c, str) and re.fullmatch(r"[-+]?[\d,.]+", (c or "").strip()))
+    avg_len = sum(len((c or "")) for c in row) / max(len(row), 1)
+    return (str_like >= max(1, len(row)//2)) and (num_like <= len(row)//3) and (avg_len <= 40)
+
+async def extract_pdf_with_pdfplumber(pdf_file_path: str) -> list:
+    """Extract tables using pdfplumber with enhanced settings"""
+    tables = []
+    header_candidates = []
+    
+    try:
+        with pdfplumber.open(pdf_file_path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"   📑 PDF has {total_pages} pages")
+            
+            for page_num, page in enumerate(pdf.pages):
+                # Extract tables from current page with improved settings
+                page_tables = page.extract_tables(
+                    table_settings={
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines", 
+                        "intersection_tolerance": 5,
+                        "snap_tolerance": 3,
+                        "join_tolerance": 3
+                    }
+                )
+                
+                if page_tables:
+                    for table_idx, table in enumerate(page_tables):
+                        if table and len(table) > 0:
+                            # Enhanced header detection
+                            first_row = table[0] if table else None
+                            has_smart_header = looks_like_header(first_row) if first_row else False
+                            
+                            if has_smart_header and first_row:
+                                # Track this header pattern
+                                header_tuple = tuple((c or "").strip() for c in first_row)
+                                header_candidates.append(header_tuple)
+                                
+                                # Use first row as headers, rest as data
+                                headers = [str((c or "")).strip() for c in first_row]
+                                rows = table[1:] if len(table) > 1 else []
+                            else:
+                                # No clear header detected, use generic column names
+                                max_cols = max(len(row) for row in table) if table else 0
+                                headers = [f"column_{j+1}" for j in range(max_cols)]
+                                rows = table
+                            
+                            # Create DataFrame with better error handling
+                            try:
+                                if rows:  # Only if we have data rows
+                                    # Ensure all rows have same length as headers
+                                    normalized_rows = []
+                                    for row in rows:
+                                        normalized_row = []
+                                        for j in range(len(headers)):
+                                            if j < len(row):
+                                                normalized_row.append(row[j])
+                                            else:
+                                                normalized_row.append(None)
+                                        normalized_rows.append(normalized_row)
+                                    
+                                    df = pd.DataFrame(normalized_rows, columns=headers)
+                                    # Remove completely empty rows
+                                    df = df.dropna(how='all')
+                                    
+                                    if not df.empty:
+                                        tables.append(df)
+                                        header_info = "✓ Smart header" if has_smart_header else "⚡ Generic header"
+                                        print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols ({header_info})")
+                            except Exception as df_error:
+                                print(f"   ⚠️ Failed to create DataFrame for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+        
+        # Check for consistent headers across pages
+        if header_candidates:
+            from collections import Counter
+            header_counter = Counter(header_candidates)
+            if header_counter:
+                most_common_header, frequency = header_counter.most_common(1)[0]
+                if frequency >= 2:
+                    print(f"   🔄 Found repeating header pattern across {frequency} tables: {list(most_common_header)[:3]}...")
+        
+        # If no tables found with default settings, try with more lenient settings
+        if not tables:
+            print("📄 Retrying with more lenient table detection settings...")
+            with pdfplumber.open(pdf_file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    # Try with more aggressive table detection
+                    page_tables = page.extract_tables(table_settings={
+                        "vertical_strategy": "text",  # More lenient
+                        "horizontal_strategy": "text",
+                        "snap_tolerance": 5,
+                        "join_tolerance": 5,
+                        "edge_min_length": 3
+                    })
+                    
+                    if page_tables:
+                        for table_idx, table in enumerate(page_tables):
+                            if table and len(table) > 1:
+                                # Use first row as headers for fallback method
+                                headers = [f"col_{j}" if not table[0][j] else str(table[0][j]).strip() 
+                                         for j in range(len(table[0]))]
+                                rows = table[1:]
+                                
+                                try:
+                                    df = pd.DataFrame(rows, columns=headers)
+                                    df = df.dropna(how='all')
+                                    
+                                    if not df.empty:
+                                        tables.append(df)
+                                        print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols (fallback)")
+                                except Exception as df_error:
+                                    print(f"   ⚠️ Fallback failed for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+                                    
+    except Exception as e:
+        print(f"❌ pdfplumber extraction failed for {pdf_file_path}: {e}")
+        
+    return tables
+
+async def process_image_with_enhanced_ocr(image_bytes: bytes, filename: str, question_text: str, extracted_files_list: list = None) -> str:
+    """Enhanced image processing with Gemini Pro for better text/data extraction"""
+    try:
+        print(f"🖼️ Processing image: {filename}")
+        
+        # Convert image to base64 for Gemini Pro
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        
+        # First try Gemini Pro for intelligent text/data extraction
+        gemini_extracted_text = await extract_data_with_gemini_pro(base64_image, filename)
+        
+        if gemini_extracted_text and gemini_extracted_text.strip():
+            print(f"✅ Gemini Pro extracted content from image: {filename}")
+            question_text += f"\n\nExtracted from image ({filename}) using Gemini Pro:\n{gemini_extracted_text}"
+            
+            # Check if extracted content contains structured data
+            if extracted_files_list is not None:
+                if await detect_and_process_data_from_text(gemini_extracted_text, filename, extracted_files_list):
+                    print(f"📊 Structured data detected and processed from image: {filename}")
+            
+            return question_text
+        
+        # Fallback to OCR if Gemini Pro fails or returns empty content
+        print("🔄 Gemini Pro failed or returned empty content, falling back to OCR API...")
+        
+        ocr_extracted_text = await extract_text_with_ocr(base64_image, filename)
+        
+        if ocr_extracted_text and ocr_extracted_text.strip():
+            print(f"✅ OCR successfully extracted content from image: {filename}")
+            question_text += f"\n\nExtracted from image ({filename}) using OCR fallback:\n{ocr_extracted_text}"
+            
+            # Check if OCR extracted content contains structured data
+            if extracted_files_list is not None:
+                if await detect_and_process_data_from_text(ocr_extracted_text, filename, extracted_files_list):
+                    print(f"📊 Structured data detected and processed from OCR text: {filename}")
+            
+            return question_text
+        else:
+            print(f"❌ Both Gemini Pro and OCR failed to extract content from image: {filename}")
+            return question_text + f"\n\n❌ Failed to extract any content from image: {filename}"
+                
+    except Exception as e:
+        print(f"❌ Error processing image {filename}: {e}")
+        
+    return question_text
+
+async def extract_text_with_ocr(base64_image: str, filename: str) -> str:
+    """Extract text from image using OCR API as fallback"""
+    try:
+        print(f"🔍 Using OCR to extract text from image: {filename}")
+        
+        if not ocr_api_key:
+            print("⚠️ OCR_API_KEY not found")
+            return None
+            
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            form_data = {
+                "base64Image": f"data:image/png;base64,{base64_image}",
+                "apikey": ocr_api_key,
+                "language": "eng",
+                "scale": "true",
+                "OCREngine": "1"
+            }
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            response = await client.post(OCR_API_URL, data=form_data, headers=headers)
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if not result.get('IsErroredOnProcessing', True):
+                    parsed_results = result.get('ParsedResults', [])
+                    if parsed_results:
+                        image_text = parsed_results[0].get('ParsedText', '').strip()
+                        if image_text:
+                            print(f"✅ OCR successfully extracted text from {filename}")
+                            return image_text
+                        else:
+                            print("ℹ️ OCR completed but no text found")
+                            return None
+                    else:
+                        print("ℹ️ OCR completed but no results returned")
+                        return None
+                else:
+                    print(f"❌ OCR processing failed: {result.get('ErrorMessage', 'Unknown error')}")
+                    return None
+            else:
+                print(f"❌ OCR API error: {response.status_code} - {response.text}")
+                return None
+                
+    except Exception as e:
+        print(f"❌ Error in OCR text extraction: {e}")
+        return None
+
+async def extract_data_with_gemini_pro(base64_image: str, filename: str) -> str:
+    """Use Gemini Pro to extract text or data from images with improved error handling"""
+    try:
+        print(f"🤖 Using Gemini Pro to analyze image: {filename}")
+        
+        if not gemini_api:
+            print("⚠️ Gemini API key not found")
+            return None
+            
+        headers = {
+            "x-goog-api-key": gemini_api,
+            "Content-Type": "application/json"
+        }
+        
+        # Create prompt for intelligent image analysis
+        analysis_prompt = """Analyze this image and extract any text, data, questions, or structured information you can find. 
+        Pay special attention to:
+        1. Any questions or text content
+        2. Tables, charts, graphs, or structured data
+        3. Numbers, statistics, or measurements
+        4. Lists or organized information
+        
+        If you find structured data (like tables), try to format it in a clear, parseable way.
+        If you find questions, extract them clearly.
+        If it's just text, extract it accurately.
+        
+        Provide a comprehensive extraction of all visible content. If you cannot see or extract any meaningful content, respond with 'NO_CONTENT_FOUND'."""
+        
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": analysis_prompt},
+                        {
+                            "inlineData": {
+                                "mimeType": "image/jpeg",
+                                "data": base64_image
+                            }
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "topK": 32,
+                "topP": 1,
+                "maxOutputTokens": 4096,
+            }
+        }
+        
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent", 
+                headers=headers, 
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                gemini_response = response.json()
+                
+                # Check if response has the expected structure
+                if "candidates" in gemini_response and len(gemini_response["candidates"]) > 0:
+                    candidate = gemini_response["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        extracted_text = candidate["content"]["parts"][0]["text"]
+                        
+                        # Check if Gemini found content
+                        if extracted_text and extracted_text.strip() and "NO_CONTENT_FOUND" not in extracted_text:
+                            print(f"✅ Gemini Pro successfully analyzed image: {filename}")
+                            return extracted_text.strip()
+                        else:
+                            print(f"ℹ️ Gemini Pro found no meaningful content in image: {filename}")
+                            return None
+                    else:
+                        print("⚠️ Gemini Pro response missing expected content structure")
+                        return None
+                else:
+                    print("⚠️ Gemini Pro response missing candidates")
+                    return None
+            else:
+                print(f"❌ Gemini Pro API error: {response.status_code} - {response.text}")
+                return None
+                
+    except Exception as e:
+        print(f"❌ Error in Gemini Pro image analysis: {e}")
+        return None
+
+async def detect_and_process_data_from_text(text_content: str, source_name: str, extracted_files_list: list = None) -> bool:
+    """Detect if text contains structured data and process it into CSV"""
+    try:
+        # Check for data patterns
+        has_tabular_data = False
+        has_numeric_data = False
+        
+        # Look for table-like patterns
+        lines = text_content.split('\n')
+        potential_table_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check for delimiter patterns (tabs, pipes, multiple spaces, commas)
+            delimiters = ['\t', '|', ',']
+            for delimiter in delimiters:
+                if delimiter in line and len(line.split(delimiter)) > 2:
+                    potential_table_lines.append(line)
+                    has_tabular_data = True
+                    break
+            
+            # Check for space-separated columns (at least 3 parts)
+            if len(line.split()) > 2 and not has_tabular_data:
+                potential_table_lines.append(line)
+                has_tabular_data = True
+        
+        # Check for numeric data patterns
+        if re.search(r'\d+[.,]\d+|\$\d+|\d+%|\d+\s*(million|billion|thousand)', text_content, re.IGNORECASE):
+            has_numeric_data = True
+        
+        if has_tabular_data or has_numeric_data:
+            print(f"📊 Structured data detected in {source_name}")
+            
+            # Use data cleaning functions to process the data
+            cleaned_data = await clean_and_structure_extracted_data(text_content, source_name)
+            
+            if cleaned_data is not None and not cleaned_data.empty:
+                # Save as CSV
+                csv_filename = f"extracted_data_{source_name.replace('.', '_').replace(' ', '_')}.csv"
+                cleaned_data.to_csv(csv_filename, index=False)
+                print(f"💾 Saved extracted data to: {csv_filename}")
+                
+                # Add to data summary
+                await update_data_summary_with_extracted_data(csv_filename, cleaned_data, source_name, extracted_files_list)
+                return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Error detecting/processing data from text: {e}")
+        return False
+
+async def clean_and_structure_extracted_data(text_content: str, source_name: str) -> pd.DataFrame:
+    """Clean and structure extracted text data using existing cleaning functions"""
+    try:
+        # Initialize data scraper for cleaning functions
+        scraper = data_scrape.DataScraper()
+        
+        # Try to parse the text into a DataFrame
+        df = None
+        
+        # Method 1: Try to detect delimiter-separated data
+        lines = [line.strip() for line in text_content.split('\n') if line.strip()]
+        
+        if len(lines) < 2:
+            return pd.DataFrame()
+        
+        # Try different delimiters
+        delimiters = ['\t', '|', ',', ';']
+        for delimiter in delimiters:
+            try:
+                # Check if most lines have the same number of parts
+                line_parts = [len(line.split(delimiter)) for line in lines if delimiter in line]
+                if len(line_parts) > 1 and len(set(line_parts)) <= 2:  # Allow some variation
+                    # Create DataFrame
+                    data_rows = []
+                    for line in lines:
+                        if delimiter in line:
+                            parts = [part.strip() for part in line.split(delimiter)]
+                            data_rows.append(parts)
+                    
+                    if data_rows:
+                        # Use first row as headers if it looks like headers
+                        first_row = data_rows[0]
+                        if any(not re.match(r'^\d+\.?\d*$', cell) for cell in first_row):
+                            df = pd.DataFrame(data_rows[1:], columns=first_row)
+                        else:
+                            df = pd.DataFrame(data_rows)
+                        break
+            except:
+                continue
+        
+        # Method 2: Try space-separated if delimiter method failed
+        if df is None:
+            try:
+                # Look for consistent column patterns
+                consistent_lines = []
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) > 2:  # At least 3 columns
+                        consistent_lines.append(parts)
+                
+                if len(consistent_lines) > 1:
+                    # Find most common number of columns
+                    col_counts = [len(line) for line in consistent_lines]
+                    most_common_cols = max(set(col_counts), key=col_counts.count)
+                    
+                    # Filter lines with the most common column count
+                    filtered_lines = [line for line in consistent_lines if len(line) == most_common_cols]
+                    
+                    if len(filtered_lines) > 1:
+                        # Use first row as headers if appropriate
+                        first_row = filtered_lines[0]
+                        if any(not re.match(r'^\d+\.?\d*$', cell) for cell in first_row):
+                            df = pd.DataFrame(filtered_lines[1:], columns=first_row)
+                        else:
+                            df = pd.DataFrame(filtered_lines)
+            except:
+                pass
+        
+        # Method 3: Create simple key-value pairs if structured data detected
+        if df is None:
+            try:
+                # Look for key: value patterns
+                key_value_pairs = []
+                for line in lines:
+                    if ':' in line:
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            key = parts[0].strip()
+                            value = parts[1].strip()
+                            key_value_pairs.append([key, value])
+                
+                if key_value_pairs:
+                    df = pd.DataFrame(key_value_pairs, columns=['Attribute', 'Value'])
+            except:
+                pass
+        
+        if df is not None and not df.empty:
+            print(f"📊 Successfully parsed data into DataFrame: {df.shape}")
+            
+            # Apply basic cleaning using existing functions
+            df = scraper._basic_clean_dataframe(df)
+            
+            # Try to clean numeric columns
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    # Check if column contains numeric data
+                    sample_values = df[col].dropna().head(10)
+                    if any(re.search(r'\d', str(val)) for val in sample_values):
+                        try:
+                            # Try to determine numeric type and clean
+                            if any('$' in str(val) or 'USD' in str(val) for val in sample_values):
+                                df[col] = scraper._clean_currency_column(df[col])
+                            elif any('%' in str(val) for val in sample_values):
+                                df[col] = scraper._clean_percentage_column(df[col])
+                            else:
+                                df[col] = scraper._clean_generic_numeric_column(df[col])
+                        except:
+                            pass  # Keep original if cleaning fails
+            
+            return df
+        
+        return pd.DataFrame()
+        
+    except Exception as e:
+        print(f"❌ Error cleaning extracted data: {e}")
+        return pd.DataFrame()
+
+async def update_data_summary_with_extracted_data(csv_filename: str, dataframe: pd.DataFrame, source_name: str, extracted_files_list: list = None):
+    """Update the data summary with information about extracted data"""
+    try:
+        # Create a summary entry for the extracted data
+        extracted_info = {
+            "filename": csv_filename,
+            "source": f"extracted_from_{source_name}",
+            "shape": list(dataframe.shape),
+            "columns": list(dataframe.columns),
+            "data_types": {col: str(dtype) for col, dtype in dataframe.dtypes.items()},
+            "sample_data": dataframe.head(3).to_dict('records') if not dataframe.empty else [],
+            "extraction_method": "gemini_pro_or_ocr",
+            "processing_timestamp": time.time()
+        }
+        
+        # Add to the extracted files list if provided
+        if extracted_files_list is not None:
+            extracted_files_list.append(extracted_info)
+        
+        # Save individual extraction info
+        extraction_info_file = f"extraction_info_{csv_filename.replace('.csv', '.json')}"
+        with open(extraction_info_file, 'w', encoding='utf-8') as f:
+            json.dump(make_json_serializable(extracted_info), f, indent=2)
+        
+        print(f"📋 Extraction info saved to: {extraction_info_file}")
+        
+    except Exception as e:
+        print(f"❌ Error updating data summary: {e}")
+
 async def process_pdf_files() -> list:
     """Process all PDF files in current directory and extract tables, combining tables with same headers"""
     pdf_data = []
@@ -749,39 +1247,42 @@ async def process_pdf_files() -> list:
     
     all_raw_tables = []  # Store all raw tables
     
-    # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
+    # First pass: Extract ALL raw tables from ALL PDFs using enhanced extraction
     print("🔄 Phase 1: Extracting raw tables from all PDFs...")
     for i, pdf_file in enumerate(pdf_files):
         try:
             print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
             
-            # Extract all tables from PDF using tabula
-            try:
-                # Extract tables with various configurations to catch different table formats
-                tables = tabula.read_pdf(
-                    pdf_file, 
-                    pages='all', 
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,  # For tables with clear borders
-                    silent=True
-                )
-                
-                # If lattice method didn't work well, try stream method
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
+            # Try pdfplumber first (better table detection)
+            tables = await extract_pdf_with_pdfplumber(pdf_file)
+            
+            # If pdfplumber didn't work well, fallback to tabula
+            if not tables or len(tables) == 0:
+                print("📄 pdfplumber found no tables, trying tabula as fallback...")
+                try:
                     tables = tabula.read_pdf(
                         pdf_file, 
                         pages='all', 
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,  # For tables without clear borders
+                        lattice=True,
                         silent=True
                     )
-                
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
-                continue
+                    
+                    if not tables or all(df.empty for df in tables):
+                        print("📄 Retrying tabula with stream method...")
+                        tables = tabula.read_pdf(
+                            pdf_file, 
+                            pages='all', 
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                        
+                except Exception as tabula_error:
+                    print(f"❌ Both pdfplumber and tabula failed for {pdf_file}: {tabula_error}")
+                    continue
             
             if not tables:
                 print(f"⚠️ No tables found in {pdf_file}")
@@ -789,7 +1290,7 @@ async def process_pdf_files() -> list:
             
             print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
             
-            # Store all raw tables with metadata (NO PROCESSING)
+            # Store all raw tables with metadata
             for j, raw_df in enumerate(tables):
                 if raw_df.empty:
                     print(f"⚠️ Table {j+1} is empty, skipping")
@@ -799,7 +1300,10 @@ async def process_pdf_files() -> list:
                     "raw_dataframe": raw_df,
                     "source_pdf": pdf_file,
                     "table_number": j + 1,
-                    "raw_columns": list(raw_df.columns)
+                    "raw_columns": list(raw_df.columns),
+                    "estimated_rows": len(raw_df),
+                    "has_smart_headers": any(col.replace('_', ' ').replace('-', ' ').strip() 
+                                           for col in raw_df.columns if not col.startswith('column_'))
                 }
                 
                 all_raw_tables.append(table_metadata)
@@ -852,7 +1356,7 @@ async def process_pdf_files() -> list:
         for table in group_data['raw_tables']:
             print(f"      - {table['source_pdf']} (table {table['table_number']})")
     
-    # Third pass: Simply merge tables and save (NO data_scrape processing)
+    # Third pass: Simply merge tables and save
     print("\n🔄 Phase 3: Merging grouped tables and saving...")
     
     for group_name, group_data in combined_data_groups.items():
@@ -864,9 +1368,10 @@ async def process_pdf_files() -> list:
         # Merge all raw tables in this group
         combined_raw_dfs = []
         source_pdfs = []
+        total_estimated_rows = 0
         
         for table_meta in raw_tables_in_group:
-            raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
+            raw_df = table_meta["raw_dataframe"].copy()
             
             # Ensure column names match the reference
             if list(raw_df.columns) != reference_columns:
@@ -879,6 +1384,7 @@ async def process_pdf_files() -> list:
             
             combined_raw_dfs.append(raw_df)
             source_pdfs.append(table_meta["source_pdf"])
+            total_estimated_rows += table_meta.get("estimated_rows", len(raw_df))
             print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
         
         # Combine all raw DataFrames
@@ -889,16 +1395,14 @@ async def process_pdf_files() -> list:
             
             # Create a meaningful filename
             if len(combined_data_groups) == 1:
-                # Only one type of table across all PDFs
                 csv_filename = "combined_tables.csv"
             else:
-                # Multiple different table types
                 first_col = reference_columns[0] if reference_columns else "data"
                 clean_name = re.sub(r'[^\w\s-]', '', str(first_col)).strip()
                 clean_name = re.sub(r'[-\s]+', '_', clean_name)
                 csv_filename = f"combined_{clean_name[:20]}.csv"
             
-            # Save the merged data directly (no processing)
+            # Save the merged data
             merged_df.to_csv(csv_filename, index=False, encoding="utf-8")
             
             table_info = {
@@ -908,8 +1412,10 @@ async def process_pdf_files() -> list:
                 "shape": merged_df.shape,
                 "columns": list(merged_df.columns),
                 "sample_data": merged_df.head(3).to_dict('records'),
-                "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
-                "formatting_applied": "None - raw data preserved"
+                "description": f"Combined table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
+                "formatting_applied": "Enhanced extraction with pdfplumber and tabula fallback",
+                "extraction_method": "pdfplumber with smart header detection",
+                "estimated_total_rows": total_estimated_rows
             }
             
             pdf_data.append(table_info)
@@ -932,8 +1438,8 @@ async def process_pdf_files() -> list:
                     "shape": raw_df.shape,
                     "columns": list(raw_df.columns),
                     "sample_data": raw_df.head(3).to_dict('records'),
-                    "description": f"Fallback raw table from {table_meta['source_pdf']} (merge failed)",
-                    "formatting_applied": "None - raw data preserved"
+                    "description": f"Fallback table from {table_meta['source_pdf']} (merge failed)",
+                    "formatting_applied": "Enhanced extraction with pdfplumber"
                 }
                 
                 pdf_data.append(table_info)
@@ -1032,10 +1538,11 @@ def create_data_summary(csv_data: list,
                         provided_json_info: dict = None,
                         extracted_csv_data: list = None,
                         extracted_html_data: list = None,
-                        extracted_json_data: list = None) -> dict:
+                        extracted_json_data: list = None,
+                        extracted_data_files: list = None) -> dict:
     """Create comprehensive data summary for LLM code generation.
     Extended to support optional provided HTML & JSON sources converted to CSV,
-    and files extracted from archives.
+    files extracted from archives, and data extracted from text/images.
     Ensures total_sources counts unique sources across categories (no double counting)."""
 
     summary = {
@@ -1050,6 +1557,7 @@ def create_data_summary(csv_data: list,
             "html_files": [],
             "json_files": []
         },
+        "extracted_from_text_images": [],  # New category for text/image extracted data
         "total_sources": 0,
     }
 
@@ -1068,6 +1576,10 @@ def create_data_summary(csv_data: list,
         summary["extracted_from_archives"]["html_files"] = extracted_html_data
     if extracted_json_data:
         summary["extracted_from_archives"]["json_files"] = extracted_json_data
+
+    # Add extracted data from text/images
+    if extracted_data_files:
+        summary["extracted_from_text_images"] = extracted_data_files
 
     summary["scraped_data"] = csv_data
     summary["database_files"] = database_info
@@ -1103,6 +1615,12 @@ def create_data_summary(csv_data: list,
             if fn:
                 identifiers.add(os.path.normpath(fn))
 
+    # Add extracted data from text/images
+    for item in extracted_data_files or []:
+        fn = item.get("filename")
+        if fn:
+            identifiers.add(os.path.normpath(fn))
+
     summary["total_sources"] = len(identifiers)
     return summary
 
@@ -1125,6 +1643,9 @@ async def aianalyst(request: Request):
     # Track files created during this request
     initial_snapshot = _snapshot_files(".")
     created_files: set[str] = set()
+    
+    # Track extracted data files for data summary
+    extracted_data_files_list = []
     
     # Initialize file type variables
     questions_file_upload = None
@@ -1175,47 +1696,20 @@ async def aianalyst(request: Request):
         content = await questions_file_upload.read()
         question_text = content.decode("utf-8")
         print(f"📝 Questions loaded from file: {questions_file_upload.filename}")
+        
+        # Check if the text file contains structured data that should be processed
+        print("🔍 Checking text content for structured data...")
+        if await detect_and_process_data_from_text(question_text, questions_file_upload.filename, extracted_data_files_list):
+            print(f"📊 Structured data detected and processed from text file: {questions_file_upload.filename}")
     else:
         question_text = "No questions provided"
 
     # Handle image if provided (existing logic)
+    # Handle image if provided (enhanced logic)
     if image:
         try:
             image_bytes = await image.read()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            
-            if not ocr_api_key:
-                print("⚠️ OCR_API_KEY not found - skipping image processing")
-                question_text += "\n\nOCR API key not configured - image text extraction skipped"
-            else:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    form_data = {
-                        "base64Image": f"data:image/png;base64,{base64_image}",
-                        "apikey": ocr_api_key,
-                        "language": "eng",
-                        "scale": "true",
-                        "OCREngine": "1"
-                    }
-                    
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    }
-                    
-                    response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if not result.get('IsErroredOnProcessing', True):
-                            parsed_results = result.get('ParsedResults', [])
-                            if parsed_results:
-                                image_text = parsed_results[0].get('ParsedText', '').strip()
-                                if image_text:
-                                    question_text += f"\n\nExtracted from image:\n{image_text}"
-                                    print("✅ Text extracted from image")
-                    else:
-                        print(f"❌ OCR API error: {response.status_code}")
-                    
+            question_text = await process_image_with_enhanced_ocr(image_bytes, image.filename, question_text, extracted_data_files_list)
         except Exception as e:
             print(f"❌ Error extracting text from image: {e}")
 
@@ -1251,48 +1745,23 @@ async def aianalyst(request: Request):
                         extracted_text = f.read()
                         question_text += f"\n\nExtracted from archive ({os.path.basename(txt_file_path)}):\n{extracted_text}"
                         print(f"📝 Added text from archive: {os.path.basename(txt_file_path)}")
+                        
+                        # Check if the extracted text contains structured data
+                        if await detect_and_process_data_from_text(extracted_text, os.path.basename(txt_file_path), extracted_data_files_list):
+                            print(f"📊 Structured data detected and processed from archive text: {os.path.basename(txt_file_path)}")
                 except Exception as e:
                     print(f"⚠️ Failed to read extracted text file {txt_file_path}: {e}")
             
             # Process extracted images for OCR
+            # Process extracted images with enhanced OCR
             for img_file_path in extracted_from_archives['image_files']:
-                if not ocr_api_key:
-                    print("⚠️ OCR_API_KEY not found - skipping extracted image processing")
-                    continue
-                    
                 try:
                     with open(img_file_path, 'rb') as f:
                         image_bytes = f.read()
-                    base64_image = base64.b64encode(image_bytes).decode("utf-8")
                     
-                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                        form_data = {
-                            "base64Image": f"data:image/png;base64,{base64_image}",
-                            "apikey": ocr_api_key,
-                            "language": "eng",
-                            "scale": "true",
-                            "OCREngine": "1"
-                        }
-                        
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        }
-                        
-                        response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            
-                            if not result.get('IsErroredOnProcessing', True):
-                                parsed_results = result.get('ParsedResults', [])
-                                if parsed_results:
-                                    image_text = parsed_results[0].get('ParsedText', '').strip()
-                                    if image_text:
-                                        question_text += f"\n\nExtracted from archive image ({os.path.basename(img_file_path)}):\n{image_text}"
-                                        print(f"✅ Text extracted from archive image: {os.path.basename(img_file_path)}")
-                        else:
-                            print(f"❌ OCR API error for {img_file_path}: {response.status_code}")
-                            
+                    filename = os.path.basename(img_file_path)
+                    question_text = await process_image_with_enhanced_ocr(image_bytes, f"archive_{filename}", question_text, extracted_data_files_list)
+                    
                 except Exception as e:
                     print(f"❌ Error processing extracted image {img_file_path}: {e}")
                     
@@ -1568,6 +2037,7 @@ async def aianalyst(request: Request):
             print(f"❌ Error processing extracted JSON {json_file_path}: {e}")
 
     # Step 3.5: Handle provided PDF file
+    # Step 3.5: Handle provided PDF file (enhanced)
     uploaded_pdf_data = []
     if pdf:
         try:
@@ -1578,38 +2048,42 @@ async def aianalyst(request: Request):
             temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
             with open(temp_pdf_filename, "wb") as f:
                 f.write(pdf_content)
-            created_files.add(os.path.normpath(temp_pdf_filename))                                                                                            
+            created_files.add(os.path.normpath(temp_pdf_filename))
             
             print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
 
-            # Extract tables (raw) then group & merge by header before any CSV creation
-            try:
-                tables = tabula.read_pdf(
-                temp_pdf_filename,
-                pages='all',
-                multiple_tables=True,
-                pandas_options={'header': 'infer'},
-                lattice=True,
-                silent=True
-            )
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
+            # Try pdfplumber first, then tabula as fallback
+            tables = await extract_pdf_with_pdfplumber(temp_pdf_filename)
+            
+            if not tables:
+                print("📄 pdfplumber found no tables, trying tabula...")
+                try:
                     tables = tabula.read_pdf(
                         temp_pdf_filename,
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,
+                        lattice=True,
                         silent=True
                     )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for uploaded PDF: {tabula_error}")
-                tables = []
+                    if not tables or all(df.empty for df in tables):
+                        print("📄 Retrying with stream method...")
+                        tables = tabula.read_pdf(
+                            temp_pdf_filename,
+                            pages='all',
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                except Exception as tabula_error:
+                    print(f"❌ Both extraction methods failed for uploaded PDF: {tabula_error}")
+                    tables = []
 
             if not tables:
                 print("⚠️ No tables found in uploaded PDF")
             else:
-                print(f"📊 Found {len(tables)} raw tables (pages) in uploaded PDF – grouping by header before saving")
+                print(f"📊 Found {len(tables)} tables in uploaded PDF – grouping by header before saving")
                 raw_tables = []
                 for j, raw_df in enumerate(tables):
                     if raw_df.empty:
@@ -1643,7 +2117,8 @@ async def aianalyst(request: Request):
 
                 for g_idx, grp in enumerate(groups, start=1):
                     merged_df = pd.concat([t["dataframe"].copy() for t in grp["tables"]], ignore_index=True)
-                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} page tables into {merged_df.shape[0]} rows")
+                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} tables into {merged_df.shape[0]} rows")
+                    
                     try:
                         cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(merged_df)
                     except Exception as fmt_err:
@@ -1652,16 +2127,17 @@ async def aianalyst(request: Request):
                         formatting_results = {}
 
                     if single_group:
-                        csv_filename = "data.csv"
+                        csv_filename = "uploaded_pdf_data.csv"
                     else:
                         first_col = grp["reference_columns"][0] if grp["reference_columns"] else f"group_{g_idx}"
                         safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
-                        csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
+                        csv_filename = f"uploaded_pdf_{safe_part or 'group'}_{g_idx}.csv"
 
                     cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
                     created_files.add(os.path.normpath(csv_filename))
+                    
                     table_info = {
-                        "filename": csv_filename,  # Add this
+                        "filename": csv_filename,
                         "source_pdf": temp_pdf_filename,
                         "table_number": g_idx,
                         "merged_from_tables": [t["table_number"] for t in grp["tables"]],
@@ -1669,7 +2145,7 @@ async def aianalyst(request: Request):
                         "shape": cleaned_df.shape,
                         "columns": list(cleaned_df.columns),
                         "sample_data": cleaned_df.head(3).to_dict('records'),
-                        "description": f"Merged table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} page tables with identical/compatible headers",
+                        "description": f"Enhanced table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} tables",
                         "formatting_applied": formatting_results
                     }
                     uploaded_pdf_data.append(table_info)
@@ -1678,42 +2154,47 @@ async def aianalyst(request: Request):
             print(f"❌ Error processing uploaded PDF: {e}")
 
     # Process extracted PDF files from archives
+    # Process extracted PDF files from archives
     extracted_pdf_data = []
     for i, pdf_file_path in enumerate(extracted_from_archives['pdf_files']):
         try:
             print(f"📄 Processing extracted PDF {i+1}: {os.path.basename(pdf_file_path)}")
             
-            # Extract tables from the PDF
-            try:
-                tables = tabula.read_pdf(
-                    pdf_file_path,
-                    pages='all',
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,
-                    silent=True
-                )
-                if not tables or all(df.empty for df in tables):
-                    print(f"📄 Retrying with stream method for {os.path.basename(pdf_file_path)}...")
+            # Try pdfplumber first, then tabula as fallback
+            tables = await extract_pdf_with_pdfplumber(pdf_file_path)
+            
+            if not tables:
+                print(f"📄 pdfplumber found no tables, trying tabula for {os.path.basename(pdf_file_path)}...")
+                try:
                     tables = tabula.read_pdf(
                         pdf_file_path,
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,
+                        lattice=True,
                         silent=True
                     )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file_path}: {tabula_error}")
-                tables = []
+                    if not tables or all(df.empty for df in tables):
+                        print(f"📄 Retrying with stream method for {os.path.basename(pdf_file_path)}...")
+                        tables = tabula.read_pdf(
+                            pdf_file_path,
+                            pages='all',
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                except Exception as tabula_error:
+                    print(f"❌ Both extraction methods failed for {pdf_file_path}: {tabula_error}")
+                    continue
 
             if not tables:
                 print(f"⚠️ No tables found in extracted PDF {os.path.basename(pdf_file_path)}")
                 continue
                 
-            print(f"📊 Found {len(tables)} raw tables in extracted PDF – processing...")
+            print(f"📊 Found {len(tables)} tables in extracted PDF – processing...")
             
-            # Group tables by similar headers (simplified version)
+            # Process each table
             base_name = os.path.splitext(os.path.basename(pdf_file_path))[0]
             sourcer = data_scrape.ImprovedWebScraper()
             
@@ -1739,9 +2220,10 @@ async def aianalyst(request: Request):
                     "shape": cleaned_df.shape,
                     "columns": list(cleaned_df.columns),
                     "sample_data": cleaned_df.head(3).to_dict('records'),
-                    "description": f"Table extracted from archive PDF: {os.path.basename(pdf_file_path)} (table {j+1})",
+                    "description": f"Enhanced table extracted from archive PDF: {os.path.basename(pdf_file_path)} (table {j+1})",
                     "formatting_applied": formatting_results,
-                    "source": "archive_extraction"
+                    "source": "archive_extraction",
+                    "extraction_method": "pdfplumber with tabula fallback"
                 }
                 extracted_pdf_data.append(table_info)
                 print(f"💾 Saved extracted PDF table as {csv_filename}")
@@ -1862,7 +2344,8 @@ async def aianalyst(request: Request):
         provided_json_info,
         extracted_csv_data,
         extracted_html_data,
-        extracted_json_data
+        extracted_json_data,
+        extracted_data_files_list
     )
     
     # Save data summary for debugging
@@ -1889,12 +2372,12 @@ async def aianalyst(request: Request):
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
     try:
-        raw_code =  await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-        print(raw_code)
-        # response = await ping_open_ai_5(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-        
-        # raw_code = response["choices"][0]["message"]["content"]
+        # raw_code =  await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
         # print(raw_code)
+        response = await ping_open_ai_5(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+        
+        raw_code = response["choices"][0]["message"]["content"]
+        print(raw_code)
     except Exception as e:
         fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
 
@@ -2020,16 +2503,16 @@ async def aianalyst(request: Request):
             # Write fix prompt safely (avoid cp1252 encoding errors on Windows)
             safe_write("fix.txt", fix_prompt)
 
-            # horizon_fix = await ping_open_ai_5(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            # fixed_code = horizon_fix["choices"][0]["message"]["content"]
+            horizon_fix = await ping_open_ai_5(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            fixed_code = horizon_fix["choices"][0]["message"]["content"]
 
 
             # gemini_fix = await ping_chatgpt(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
             # fixed_code = gemini_fix["choices"][0]["message"]["content"]
 
 
-            gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            fixed_code = gemini_fix
+            # gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            # fixed_code = gemini_fix
 
 
             # Clean the fixed code
