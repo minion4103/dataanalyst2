@@ -2233,3 +2233,27 @@ class ImprovedWebScraper:
                 "files_saved": []
             }
 
+
+class DataScraper:
+    """Compatibility wrapper class that provides the methods expected by app.py"""
+    
+    def __init__(self):
+        self.numeric_formatter = NumericFieldFormatter()
+        self.web_scraper = WebScraper()
+    
+    def _basic_clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Basic DataFrame cleaning - delegates to WebScraper"""
+        return self.web_scraper._basic_clean_dataframe(df)
+    
+    def _clean_currency_column(self, series: pd.Series) -> pd.Series:
+        """Clean currency values - delegates to NumericFieldFormatter"""
+        return self.numeric_formatter._clean_currency_column(series)
+    
+    def _clean_percentage_column(self, series: pd.Series) -> pd.Series:
+        """Clean percentage values - delegates to NumericFieldFormatter"""
+        return self.numeric_formatter._clean_percentage_column(series)
+    
+    def _clean_generic_numeric_column(self, series: pd.Series) -> pd.Series:
+        """Clean generic numeric values - delegates to NumericFieldFormatter"""
+        return self.numeric_formatter._clean_generic_numeric_column(series)
+
